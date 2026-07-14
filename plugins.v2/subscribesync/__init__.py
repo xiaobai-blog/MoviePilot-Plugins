@@ -108,7 +108,7 @@ def is_cloudflare_challenge(text: str) -> bool:
 class SubscribeSync(_PluginBase):
     # 插件元数据
     plugin_name = "订阅同步"
-    plugin_version = "1.5.3"
+    plugin_version = "1.5.4"
     plugin_author = "AutoBuilder"
     author_url = "https://github.com"
     plugin_description = (
@@ -1577,6 +1577,7 @@ class SubscribeSync(_PluginBase):
         if not mp_items:
             logger.warning("[SubscribeSync] MP 无订阅，跳过")
             return {"success": True, "cancel": 0, "cancel_total": 0, "add": 0, "add_total": 0}
+        logger.info(f"[SubscribeSync] MP 共有 {len(mp_items)} 条订阅，tmdbid: {[str(it.get('tmdbid') or '?') for it in mp_items]}")
 
         # 2) 拉取 SA 订阅
         auth = self._ensure_sa_token()
@@ -1588,6 +1589,7 @@ class SubscribeSync(_PluginBase):
         sa_items = self._fetch_sa_tasks(token, cookie)
         if sa_items is None:
             return {"error": "拉取 SA 任务失败", "success": False}
+        logger.info(f"[SubscribeSync] SA 共有 {len(sa_items)} 条订阅，tmdbid: {[str(it.get('tmdbid') or '') for it in sa_items]}")
 
         sa_tmdbids = {str(it.get("tmdbid") or "") for it in sa_items if it.get("tmdbid")}
         sa_tmdbids.discard("")
@@ -1625,8 +1627,9 @@ class SubscribeSync(_PluginBase):
                 cancel_fail.append(name)
                 logger.error(f"[SubscribeSync] ✗ 取消失败：{name}（{sc}）")
 
-        # 5) 推送 SA（含 401/403 自动重登录）
+        # 5) 推送 SA（含 401/403 自动重登录 + 详细日志）
         add_ok, add_fail, add_skip = [], [], []
+        sa_before_count = len(sa_items)  # 推送前的 SA 任务数
         if to_add:
             _push_token = token
             _push_cookie = cookie
@@ -1636,19 +1639,34 @@ class SubscribeSync(_PluginBase):
                 kind = classify_type(it.get("type"))
                 if kind is None:
                     add_skip.append(name)
+                    logger.warning(f"[SubscribeSync] 推送「{name}」跳过：类型 {it.get('type')} 无法识别")
                     continue
 
-                logger.info(f"[SubscribeSync] ({i}/{len(to_add)}) 推送「{name}」({kind}) ...")
+                tmdbid_val = str(it.get("tmdbid") or it.get("tmdb_id") or "")
+                year_val = int(it.get("year") or 0)
+                logger.info(
+                    f"[SubscribeSync] ({i}/{len(to_add)}) 推送「{name}」"
+                    f" kind={kind} tmdbid={tmdbid_val} year={year_val} ..."
+                )
 
                 sa_data = None
                 if kind == "tv":
                     tvdbid = it.get("tvdbid") or it.get("tvdb_id")
                     if not tvdbid:
-                        tvdbid = str(it.get("tmdbid") or it.get("tmdb_id") or "")
+                        tvdbid = tmdbid_val
                     if tvdbid:
                         sa_data = self._query_sa_season_count(_push_token, _push_cookie, name, tvdbid)
+                        logger.info(f"[SubscribeSync] 「{name}」SA 季集数查询结果：{str(sa_data)[:200]}")
 
                 filled = self._build_filled_template(it, kind, sa_data)
+                # 打印关键模板字段
+                logger.info(
+                    f"[SubscribeSync] 推送模板: title={filled.get('title')} "
+                    f"type={filled.get('type')} tmdbid={filled.get('tmdbid')} "
+                    f"year={filled.get('year')} season={filled.get('season')} "
+                    f"parent_id={filled.get('parent_id')} rule_id={filled.get('rule_id')} "
+                    f"id={repr(filled.get('id'))}"
+                )
 
                 save_headers = {
                     "Authorization": f"Bearer {_push_token}",
@@ -1661,13 +1679,9 @@ class SubscribeSync(_PluginBase):
                 if _push_cookie:
                     save_headers["Cookie"] = _push_cookie
 
+                push_url = f"{self._sa_base}/api/v1/telegram_subscribe/save_telegram_subscribe_task"
                 try:
-                    r = self._http_post(
-                        f"{self._sa_base}/api/v1/telegram_subscribe/save_telegram_subscribe_task",
-                        headers=save_headers,
-                        json_data=filled,
-                        timeout=self._sa_timeout,
-                    )
+                    r = self._http_post(push_url, headers=save_headers, json_data=filled, timeout=self._sa_timeout)
                 except Exception as e:
                     add_fail.append(name)
                     logger.error(f"[SubscribeSync] 推送「{name}」网络异常：{e}")
@@ -1690,12 +1704,7 @@ class SubscribeSync(_PluginBase):
                         if _push_cookie:
                             save_headers["Cookie"] = _push_cookie
                         try:
-                            r = self._http_post(
-                                f"{self._sa_base}/api/v1/telegram_subscribe/save_telegram_subscribe_task",
-                                headers=save_headers,
-                                json_data=filled,
-                                timeout=self._sa_timeout,
-                            )
+                            r = self._http_post(push_url, headers=save_headers, json_data=filled, timeout=self._sa_timeout)
                         except Exception as e:
                             add_fail.append(name)
                             logger.error(f"[SubscribeSync] 推送「{name}」重试异常：{e}")
@@ -1703,13 +1712,24 @@ class SubscribeSync(_PluginBase):
                     else:
                         logger.error(f"[SubscribeSync] 重登录失败：{res['error']}")
 
+                resp_body = (r.text or "")[:800]
                 if r.status_code in (200, 201):
                     add_ok.append(name)
-                    logger.info(f"[SubscribeSync] ✓ 已推送 SA：{name}")
+                    logger.info(f"[SubscribeSync] ✓ 已推送 SA：{name}，SA 响应：{resp_body}")
                 else:
                     add_fail.append(name)
-                    resp_text = (r.text or "")[:500]
-                    logger.error(f"[SubscribeSync] ✗ 推送 SA 失败：{name}（HTTP {r.status_code}）：{resp_text}")
+                    logger.error(f"[SubscribeSync] ✗ 推送 SA 失败：{name}（HTTP {r.status_code}）：{resp_body}")
+
+        # 推送后验证：重新拉取 SA 任务，检查数量变化
+        logger.info(f"[SubscribeSync] 推送前 SA 任务数 = {sa_before_count}，推送成功 = {len(add_ok)}，重新拉取验证...")
+        verify_items = self._fetch_sa_tasks(token, cookie)
+        if verify_items is not None:
+            logger.info(f"[SubscribeSync] 推送后 SA 任务数 = {len(verify_items)}（变化：{len(verify_items) - sa_before_count}）")
+            # 列出推送后 SA 中所有 task 的 tmdbid
+            verify_tmdbids = [str(it.get("tmdbid") or "") for it in verify_items if it.get("tmdbid")]
+            logger.info(f"[SubscribeSync] SA 中现有 tmdbid: {verify_tmdbids}")
+        else:
+            logger.error("[SubscribeSync] 验证失败：无法重新拉取 SA 任务")
 
         # 汇总日志
         lines = ["=" * 50, "mp同步sa 汇总", "=" * 50]
@@ -1797,12 +1817,16 @@ class SubscribeSync(_PluginBase):
         except Exception:
             logger.error("[SubscribeSync] SA 返回非 JSON")
             return None
+        logger.info(f"[SubscribeSync] SA 原始响应前 500 字符：{json.dumps(data, ensure_ascii=False)[:500]}")
         items = data.get("data") if isinstance(data, dict) else data
         if isinstance(items, dict):
             items = [items]
         if not isinstance(items, list):
+            logger.warning(f"[SubscribeSync] SA 任务列表格式异常，items 类型={type(items)}")
             items = []
-        return [self._normalize_sa_item(it) for it in items if isinstance(it, dict)]
+        result = [self._normalize_sa_item(it) for it in items if isinstance(it, dict)]
+        logger.info(f"[SubscribeSync] SA 任务解析完成：{len(result)} 条，tmdbid: {[str(it.get('tmdbid') or '?') for it in result]}")
+        return result
 
     def _mp_delete_subscribe(self, sub_id, tmdbid: str) -> int:
         """删除 MP 订阅，优先本地数据库。"""
