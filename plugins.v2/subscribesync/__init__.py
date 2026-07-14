@@ -1,0 +1,1897 @@
+"""
+MoviePilot V2 插件：订阅同步
+===========================
+功能：
+1) 拉取源 MP 订阅列表，按用户分组展示
+2) 拉取目标 SA telegram 订阅任务列表
+3) 同步订阅：MP → SA（电视剧查询季集数 + 电影填模板）
+4) mp同步sa：对比 MP 与 SA 订阅（按 tmdbid），SA 已有的取消 MP 订阅，MP 有而 SA 无的推送到 SA
+5) 定时任务 + 手动触发
+6) Telegram 命令控制
+"""
+
+import json
+import re
+import time
+import base64
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+from app.plugins import _PluginBase
+from app.log import logger
+from app.schemas import Notification, NotificationType
+from app.schemas.types import EventType
+
+
+# ===== 常量 =====
+STATE_MAP = {
+    "N": ("新建", "info"),
+    "R": ("订阅中", "primary"),
+    "P": ("已暂停", "warning"),
+    "S": ("已完成", "success"),
+}
+TYPE_MAP = {
+    "电影": "电影", "电视剧": "电视剧",
+    "movie": "电影", "tv": "电视剧", "series": "电视剧",
+}
+TV_TYPES = {"tv", "series", "电视剧", "剧集"}
+MOVIE_TYPES = {"movie", "电影", "mov"}
+
+BROWSER_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1"
+)
+
+SYNC_CONCURRENCY = 5  # 并发查询 SA 季集数
+
+
+# ===== 工具函数 =====
+def normalize_poster(poster: str) -> str:
+    if not poster:
+        return ""
+    if poster.startswith("http://") or poster.startswith("https://"):
+        return poster
+    return "https://image.tmdb.org/t/p/w500" + poster
+
+
+def mask_secret(s: str) -> str:
+    if not s:
+        return ""
+    if len(s) <= 12:
+        return s[:2] + "***"
+    return s[:8] + "***" + s[-4:]
+
+
+def classify_type(raw_type):
+    t = (raw_type or "").strip().lower()
+    if t in TV_TYPES:
+        return "tv"
+    if t in MOVIE_TYPES:
+        return "movie"
+    return None
+
+
+def safe_filename(name: str) -> str:
+    name = (name or "unknown").strip()
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    return name[:80] if len(name) > 80 else name
+
+
+def decode_jwt_exp(token: str):
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data.get("exp")
+    except Exception:
+        return None
+
+
+def is_cloudflare_challenge(text: str) -> bool:
+    if not text:
+        return False
+    return ("Just a moment" in text) or ("cf-mitigated" in text) or ("challenge-platform" in text)
+
+
+# ===== 主插件类 =====
+class SubscribeSync(_PluginBase):
+    # 插件元数据
+    plugin_name = "订阅同步"
+    plugin_version = "1.0.0"
+    plugin_author = "AutoBuilder"
+    author_url = "https://github.com"
+    plugin_description = (
+        "订阅同步插件：拉取 MP 订阅与 SA telegram 订阅，按 tmdbid 对齐同步，"
+        "支持定时执行与 Telegram 命令控制。"
+    )
+    plugin_config_prefix = "SubscribeSync_"
+
+    # 插件级别：1 = 用户级（常驻），2 = 系统级
+    plugin_level = 1
+
+    # -------- 默认配置 --------
+    @staticmethod
+    def default_config() -> Dict[str, Any]:
+        return {
+            "enabled": False,
+            # 源 MP 配置（本实例或远程）
+            "mp_base_url": "http://localhost:3000",
+            "mp_api_token": "",
+            "mp_timeout": 15,
+            # 目标 SA 配置
+            "sa_base_url": "https://sa.lxb.icu",
+            "sa_username": "",
+            "sa_password": "",
+            "sa_timeout": 20,
+            "sa_cookie": "",
+            # 任务调度
+            "task_cron": "0 * * * *",
+            "task_enabled": False,
+            "task_order": ["mp", "sa", "sync", "mp_sync_sa"],
+            "enabled_tasks": {"mp": True, "sa": True, "sync": True, "mp_sync_sa": True},
+            # Telegram
+            "tg_bot_token": "",
+            "tg_chat_id": "",
+            # 其他
+            "sync_concurrency": 5,
+            "notify_new_sub": True,
+        }
+
+    # ==================== 生命周期 ====================
+
+    def init_plugin(self, config: dict = None):
+        """初始化插件：读取配置、加载持久化数据。"""
+        self._config = config or self.default_config()
+
+        self._mp_base = self._config.get("mp_base_url", "").rstrip("/")
+        self._mp_token = self._config.get("mp_api_token", "")
+        self._mp_timeout = float(self._config.get("mp_timeout", 15))
+
+        self._sa_base = self._config.get("sa_base_url", "").rstrip("/")
+        self._sa_user = self._config.get("sa_username", "")
+        self._sa_pass = self._config.get("sa_password", "")
+        self._sa_timeout = float(self._config.get("sa_timeout", 20))
+        self._sa_cookie = self._config.get("sa_cookie", "")
+
+        self._task_cron = self._config.get("task_cron", "0 * * * *")
+        self._task_enabled = self._config.get("task_enabled", False)
+        self._task_order = self._config.get("task_order", ["mp", "sa", "sync", "mp_sync_sa"])
+        self._enabled_tasks = self._config.get(
+            "enabled_tasks", {"mp": True, "sa": True, "sync": True, "mp_sync_sa": True}
+        )
+
+        self._tg_token = self._config.get("tg_bot_token", "")
+        self._tg_chat = self._config.get("tg_chat_id", "")
+        self._notify_new = self._config.get("notify_new_sub", True)
+        self._sync_concurrency = int(self._config.get("sync_concurrency", 5))
+
+        # 运行时状态
+        self._running = False
+        self._sa_session = self._load_sa_session()
+        self._cache = {"mp": None, "sa": None, "sync": None}
+        self._enabled = self._config.get("enabled", False)
+
+        self._load_cache()
+        logger.info(f"[SubscribeSync] 插件初始化完成，启用状态: {self._enabled}")
+
+        # 处理手动触发开关
+        if self._config.get("run_sync_mp"):
+            logger.info("[SubscribeSync] 手动触发：同步 MP 订阅")
+            threading.Thread(target=self._sync_mp, daemon=True).start()
+        if self._config.get("run_sync_sa"):
+            logger.info("[SubscribeSync] 手动触发：同步 SA 订阅")
+            threading.Thread(target=self._sync_sa, daemon=True).start()
+        if self._config.get("run_sync"):
+            logger.info("[SubscribeSync] 手动触发：开始同步")
+            threading.Thread(target=self._sync, daemon=True).start()
+        if self._config.get("run_mp_sync_sa"):
+            logger.info("[SubscribeSync] 手动触发：mp同步sa")
+            threading.Thread(target=self._mp_sync_sa, daemon=True).start()
+
+        # 重置手动触发开关
+        if any(self._config.get(k) for k in ("run_sync_mp", "run_sync_sa", "run_sync", "run_mp_sync_sa")):
+            self._config["run_sync_mp"] = False
+            self._config["run_sync_sa"] = False
+            self._config["run_sync"] = False
+            self._config["run_mp_sync_sa"] = False
+            self.update_config(self._config)
+
+    def get_state(self) -> bool:
+        return self._enabled
+
+    def stop_service(self):
+        """停止所有后台任务。"""
+        self._running = False
+        logger.info("[SubscribeSync] 插件服务已停止")
+
+    # ==================== 配置表单 ====================
+
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """返回配置页面 Vuetify JSON 与默认数据模型。"""
+        return [
+            {
+                "component": "VForm",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "enabled", "label": "启用插件"},
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "task_enabled", "label": "启用定时任务"},
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    # ---- 源 MP 配置 ----
+                    {
+                        "component": "VSubheader",
+                        "props": {},
+                        "content": [{"component": "span", "props": {}, "content": [{"component": "text", "props": {}, "text": "源 MoviePilot 配置"}]}],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "mp_base_url",
+                                            "label": "MP 地址",
+                                            "placeholder": "http://localhost:3000",
+                                            "hint": "源 MoviePilot 实例地址",
+                                            "persistent-hint": True,
+                                        },
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "mp_api_token",
+                                            "label": "API Token",
+                                            "placeholder": "从 MP 后台「设置」中获取",
+                                            "type": "password",
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    # ---- 目标 SA 配置 ----
+                    {
+                        "component": "VSubheader",
+                        "props": {},
+                        "content": [{"component": "span", "props": {}, "content": [{"component": "text", "props": {}, "text": "目标 SA 配置"}]}],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {"model": "sa_base_url", "label": "SA 地址", "placeholder": "https://sa.lxb.icu"},
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {"model": "sa_username", "label": "SA 账号"},
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "sa_password",
+                                            "label": "SA 密码",
+                                            "type": "password",
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "sa_cookie",
+                                            "label": "Cloudflare Cookie（可选）",
+                                            "placeholder": "cf_clearance=xxx",
+                                        },
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "sa_timeout",
+                                            "label": "超时（秒）",
+                                            "type": "number",
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    # ---- Telegram 配置 ----
+                    {
+                        "component": "VSubheader",
+                        "props": {},
+                        "content": [{"component": "span", "props": {}, "content": [{"component": "text", "props": {}, "text": "Telegram 通知（可选）"}]}],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "tg_bot_token",
+                                            "label": "Bot Token",
+                                            "type": "password",
+                                            "placeholder": "从 @BotFather 获取",
+                                        },
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "tg_chat_id",
+                                            "label": "Chat ID",
+                                        },
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 2},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "notify_new_sub", "label": "新订阅通知"},
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    # ---- 定时任务 ----
+                    {
+                        "component": "VSubheader",
+                        "props": {},
+                        "content": [{"component": "span", "props": {}, "content": [{"component": "text", "props": {}, "text": "定时任务"}]}],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "task_cron",
+                                            "label": "Cron 表达式",
+                                            "placeholder": "0 * * * *",
+                                            "hint": "分 时 日 月 周，示例：每小时=0 * * * *，每天8点=0 8 * * *",
+                                            "persistent-hint": True,
+                                        },
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "task_order",
+                                            "label": "执行顺序",
+                                            "multiple": True,
+                                            "chips": True,
+                                            "items": [
+                                                {"title": "同步 MP 订阅", "value": "mp"},
+                                                {"title": "同步 SA 订阅", "value": "sa"},
+                                                {"title": "开始同步", "value": "sync"},
+                                                {"title": "mp同步sa", "value": "mp_sync_sa"},
+                                            ],
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {"component": "VSwitch", "props": {"model": "enabled_tasks.mp", "label": "启用 MP 同步"}},
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {"component": "VSwitch", "props": {"model": "enabled_tasks.sa", "label": "启用 SA 同步"}},
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {"component": "VSwitch", "props": {"model": "enabled_tasks.sync", "label": "启用 同步"}},
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {"component": "VSwitch", "props": {"model": "enabled_tasks.mp_sync_sa", "label": "启用 mp同步sa"}},
+                                ],
+                            },
+                        ],
+                    },
+                    # ---- 手动触发 ----
+                    {
+                        "component": "VSubheader",
+                        "props": {},
+                        "content": [{"component": "span", "props": {}, "content": [{"component": "text", "props": {}, "text": "手动触发（保存后执行一次）"}]}],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "run_sync_mp", "label": "同步 MP 订阅"},
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "run_sync_sa", "label": "同步 SA 订阅"},
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "run_sync", "label": "开始同步"},
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "run_mp_sync_sa", "label": "mp同步sa"},
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ], {
+            "enabled": False,
+            "mp_base_url": "http://localhost:3000",
+            "mp_api_token": "",
+            "mp_timeout": 15,
+            "sa_base_url": "https://sa.lxb.icu",
+            "sa_username": "",
+            "sa_password": "",
+            "sa_timeout": 20,
+            "sa_cookie": "",
+            "task_cron": "0 * * * *",
+            "task_enabled": False,
+            "task_order": ["mp", "sa", "sync", "mp_sync_sa"],
+            "enabled_tasks": {"mp": True, "sa": True, "sync": True, "mp_sync_sa": True},
+            "tg_bot_token": "",
+            "tg_chat_id": "",
+            "sync_concurrency": 5,
+            "notify_new_sub": True,
+            "run_sync_mp": False,
+            "run_sync_sa": False,
+            "run_sync": False,
+            "run_mp_sync_sa": False,
+        }
+
+    # ==================== 详情页 ====================
+
+    def get_page(self) -> List[dict]:
+        """返回详情页面（展示缓存数据）。"""
+        return [
+            {
+                "component": "VContainer",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VCard",
+                                        "content": [
+                                            {
+                                                "component": "VCardTitle",
+                                                "content": [{"component": "text", "props": {}, "text": "数据概览"}],
+                                            },
+                                            {
+                                                "component": "VCardText",
+                                                "content": [
+                                                    {
+                                                        "component": "VRow",
+                                                        "content": [
+                                                            {
+                                                                "component": "VCol",
+                                                                "props": {"cols": 12, "md": 4},
+                                                                "content": [
+                                                                    {
+                                                                        "component": "span",
+                                                                        "props": {"class": "text-h6"},
+                                                                        "content": [
+                                                                            {"component": "text", "props": {}, "text": "MP 订阅缓存：{{ SubscribeSync_mp_updated }}"},
+                                                                        ],
+                                                                    },
+                                                                    {"component": "VDivider", "props": {}},
+                                                                    {
+                                                                        "component": "VTable",
+                                                                        "props": {"items": "SubscribeSync_mp_items", "hover": True, "density": "compact"},
+                                                                        "content": [
+                                                                            {
+                                                                                "component": "colgroup",
+                                                                                "content": [
+                                                                                    {"component": "col", "props": {"style": "width:50%"}},
+                                                                                    {"component": "col", "props": {"style": "width:30%"}},
+                                                                                    {"component": "col", "props": {"style": "width:20%"}},
+                                                                                ],
+                                                                            },
+                                                                        ],
+                                                                    },
+                                                                ],
+                                                            },
+                                                            {
+                                                                "component": "VCol",
+                                                                "props": {"cols": 12, "md": 4},
+                                                                "content": [
+                                                                    {
+                                                                        "component": "span",
+                                                                        "props": {"class": "text-h6"},
+                                                                        "content": [
+                                                                            {"component": "text", "props": {}, "text": "SA 订阅缓存：{{ SubscribeSync_sa_updated }}"},
+                                                                        ],
+                                                                    },
+                                                                    {"component": "VDivider", "props": {}},
+                                                                    {
+                                                                        "component": "span",
+                                                                        "props": {"class": "text-body-1"},
+                                                                        "content": [{"component": "text", "props": {}, "text": "共 {{ SubscribeSync_sa_count }} 条"}],
+                                                                    },
+                                                                ],
+                                                            },
+                                                            {
+                                                                "component": "VCol",
+                                                                "props": {"cols": 12, "md": 4},
+                                                                "content": [
+                                                                    {
+                                                                        "component": "span",
+                                                                        "props": {"class": "text-h6"},
+                                                                        "content": [
+                                                                            {"component": "text", "props": {}, "text": "同步缓存：{{ SubscribeSync_sync_updated }}"},
+                                                                        ],
+                                                                    },
+                                                                    {"component": "VDivider", "props": {}},
+                                                                    {
+                                                                        "component": "span",
+                                                                        "props": {"class": "text-body-1"},
+                                                                        "content": [{"component": "text", "props": {}, "text": "{{ SubscribeSync_sync_summary }}"}],
+                                                                    },
+                                                                ],
+                                                            },
+                                                        ],
+                                                    },
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ]
+
+    # ==================== API 端点 ====================
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "path": "/sync_mp",
+                "endpoint": self._api_sync_mp,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "同步 MP 订阅",
+            },
+            {
+                "path": "/sync_sa",
+                "endpoint": self._api_sync_sa,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "同步 SA 订阅",
+            },
+            {
+                "path": "/sync",
+                "endpoint": self._api_sync,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "开始同步（电视剧+电影）",
+            },
+            {
+                "path": "/mp_sync_sa",
+                "endpoint": self._api_mp_sync_sa,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "mp同步sa（对比并推送）",
+            },
+            {
+                "path": "/run_sequence",
+                "endpoint": self._api_run_sequence,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即执行任务序列",
+            },
+            {
+                "path": "/data/mp",
+                "endpoint": self._api_data_mp,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取 MP 缓存数据",
+            },
+            {
+                "path": "/data/sa",
+                "endpoint": self._api_data_sa,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取 SA 缓存数据",
+            },
+            {
+                "path": "/data/sync",
+                "endpoint": self._api_data_sync,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取同步缓存数据",
+            },
+            {
+                "path": "/sa_status",
+                "endpoint": self._api_sa_status,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "SA 登录状态",
+            },
+            {
+                "path": "/sa_login",
+                "endpoint": self._api_sa_login,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "SA 登录",
+            },
+            {
+                "path": "/sa_logout",
+                "endpoint": self._api_sa_logout,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "SA 登出",
+            },
+            {
+                "path": "/unsubscribe",
+                "endpoint": self._api_mp_unsubscribe,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "取消 MP 订阅",
+            },
+        ]
+
+    # ==================== 定时服务 ====================
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """注册定时任务。"""
+        if not self._enabled or not self._task_enabled:
+            return []
+        return [
+            {
+                "id": "SubscribeSync_scheduler",
+                "name": "订阅同步定时任务",
+                "trigger": CronTrigger.from_crontab(self._task_cron),
+                "func": self._run_sequence,
+                "kwargs": {},
+            },
+        ]
+
+    # ==================== 远程命令 ====================
+
+    def get_command(self) -> List[Dict[str, Any]]:
+        """注册 Telegram 命令。"""
+        if not self._tg_token or not self._tg_chat:
+            return []
+        return [
+            {"cmd": "/sync_mp", "event": EventType.PluginAction, "desc": "同步 MP 订阅", "data": {"action": "sync_mp"}},
+            {"cmd": "/sync_sa", "event": EventType.PluginAction, "desc": "同步 SA 订阅", "data": {"action": "sync_sa"}},
+            {"cmd": "/sync", "event": EventType.PluginAction, "desc": "开始同步", "data": {"action": "sync"}},
+            {"cmd": "/mp_sync_sa", "event": EventType.PluginAction, "desc": "mp同步sa", "data": {"action": "mp_sync_sa"}},
+            {"cmd": "/run_sequence", "event": EventType.PluginAction, "desc": "执行任务序列", "data": {"action": "run_sequence"}},
+        ]
+
+    # ==================== 核心业务逻辑 ====================
+
+    # -------- 配置读写 --------
+    def _reload_config(self):
+        """重新读取配置（在手动触发操作前调用确保配置最新）。"""
+        cfg = self.get_config() or {}
+        if cfg:
+            self._config = cfg
+            self._mp_base = cfg.get("mp_base_url", "").rstrip("/")
+            self._mp_token = cfg.get("mp_api_token", "")
+            self._mp_timeout = float(cfg.get("mp_timeout", 15))
+            self._sa_base = cfg.get("sa_base_url", "").rstrip("/")
+            self._sa_user = cfg.get("sa_username", "")
+            self._sa_pass = cfg.get("sa_password", "")
+            self._sa_timeout = float(cfg.get("sa_timeout", 20))
+            self._sa_cookie = cfg.get("sa_cookie", "")
+            self._task_cron = cfg.get("task_cron", "0 * * * *")
+            self._task_enabled = cfg.get("task_enabled", False)
+            self._task_order = cfg.get("task_order", ["mp", "sa", "sync", "mp_sync_sa"])
+            self._enabled_tasks = cfg.get(
+                "enabled_tasks", {"mp": True, "sa": True, "sync": True, "mp_sync_sa": True}
+            )
+            self._tg_token = cfg.get("tg_bot_token", "")
+            self._tg_chat = cfg.get("tg_chat_id", "")
+            self._notify_new = cfg.get("notify_new_sub", True)
+            self._sync_concurrency = int(cfg.get("sync_concurrency", 5))
+            self._enabled = cfg.get("enabled", False)
+
+    # -------- 数据持久化 --------
+    def _load_sa_session(self) -> dict:
+        try:
+            data = self.get_data("sa_session")
+            return json.loads(data) if data else {}
+        except Exception:
+            return {}
+
+    def _save_sa_session(self, session: dict):
+        try:
+            self.save_data("sa_session", json.dumps(session, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def _load_cache(self):
+        for k in ("mp", "sa", "sync"):
+            try:
+                data = self.get_data(f"cache_{k}")
+                self._cache[k] = json.loads(data) if data else None
+            except Exception:
+                self._cache[k] = None
+
+    def _save_cache(self):
+        for k in ("mp", "sa", "sync"):
+            if self._cache.get(k) is not None:
+                try:
+                    self.save_data(f"cache_{k}", json.dumps(self._cache[k], ensure_ascii=False))
+                except Exception:
+                    pass
+
+    # -------- HTTP 请求（同步） --------
+    def _http_get(self, url: str, headers: dict = None, timeout: float = 20, params: dict = None) -> httpx.Response:
+        """同步 GET 请求。"""
+        h = headers or {}
+        h.setdefault("User-Agent", BROWSER_UA)
+        with httpx.Client(timeout=timeout, verify=False, follow_redirects=True) as client:
+            return client.get(url, headers=h, params=params or {})
+
+    def _http_post(self, url: str, headers: dict = None, json_data: dict = None,
+                   data: dict = None, files: dict = None, timeout: float = 20) -> httpx.Response:
+        """同步 POST 请求。"""
+        h = headers or {}
+        h.setdefault("User-Agent", BROWSER_UA)
+        kwargs = {}
+        if json_data is not None:
+            kwargs["json"] = json_data
+        elif data is not None:
+            kwargs["data"] = data
+        elif files is not None:
+            kwargs["files"] = files
+        with httpx.Client(timeout=timeout, verify=False, follow_redirects=True) as client:
+            return client.post(url, headers=h, **kwargs)
+
+    def _http_delete(self, url: str, headers: dict = None, timeout: float = 15) -> httpx.Response:
+        """同步 DELETE 请求。"""
+        h = headers or {}
+        h.setdefault("User-Agent", BROWSER_UA)
+        with httpx.Client(timeout=timeout, verify=False) as client:
+            return client.delete(url, headers=h)
+
+    # -------- SA 登录 --------
+    def _do_sa_login(self, username: str, password: str, cookie: str = "") -> dict:
+        """登录 SA 获取 Token 和 Cookie。"""
+        base_headers = {
+            "Accept": "application/json",
+            "Origin": self._sa_base,
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+        }
+        if cookie:
+            base_headers["Cookie"] = cookie
+
+        attempts = [
+            (f"{self._sa_base}/api/v1/login", "form"),
+            (f"{self._sa_base}/api/v1/login", "multipart"),
+            (f"{self._sa_base}/api/v1/login/access-token", "form"),
+            (f"{self._sa_base}/api/v1/login/access-token", "multipart"),
+        ]
+        last_err = "登录失败"
+
+        for url, mode in attempts:
+            logger.info(f"[SubscribeSync] 尝试 SA 登录：{url} ({mode})，账号：{username}")
+            headers = dict(base_headers)
+            kwargs = {}
+            if mode == "form":
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+                kwargs["data"] = {"username": username, "password": password}
+            else:
+                kwargs["files"] = {"username": (None, username), "password": (None, password)}
+
+            try:
+                if mode == "form":
+                    r = self._http_post(url, headers=headers, data=kwargs["data"], timeout=self._sa_timeout)
+                else:
+                    r = self._http_post(url, headers=headers, files=kwargs["files"], timeout=self._sa_timeout)
+                srv_cookie = "; ".join([f"{k}={v}" for k, v in r.cookies.items()])
+            except Exception as e:
+                last_err = f"请求失败：{e}"
+                continue
+
+            if r.status_code == 403 and is_cloudflare_challenge(r.text):
+                logger.error("[SubscribeSync] SA 登录被 Cloudflare 拦截")
+                return {"ok": False, "error": "被 Cloudflare 拦截，请在配置中填入 cf_clearance Cookie"}
+            if r.status_code == 401:
+                logger.error("[SubscribeSync] SA 登录 401：账号密码错误")
+                return {"ok": False, "error": "账号或密码错误（401）"}
+            if r.status_code != 200:
+                last_err = f"登录端点 {url} 返回 {r.status_code}"
+                logger.info(f"[SubscribeSync] {last_err}，尝试下一个端点")
+                continue
+
+            # 解析 Token
+            try:
+                data = r.json()
+                token = (data.get("access_token") or data.get("token") or "").strip()
+                if token.lower().startswith("bearer "):
+                    token = token[7:].strip()
+            except Exception:
+                token = ""
+
+            if not token and r.cookies.get("token"):
+                token = r.cookies.get("token").strip()
+                if token.lower().startswith("bearer "):
+                    token = token[7:].strip()
+
+            if not token:
+                candidate = (r.text or "").strip().strip('"').strip("'")
+                if candidate.count(".") == 2:
+                    token = candidate.strip()
+                    if token.lower().startswith("bearer "):
+                        token = token[7:].strip()
+
+            if not token:
+                ctype = r.headers.get("content-type", "")
+                snippet = (r.text or "")[:400]
+                last_err = f"登录端点 {url} 未返回 token（content-type: {ctype}）"
+                logger.info(f"[SubscribeSync] {last_err}，响应片段: {snippet}")
+                continue
+
+            exp = decode_jwt_exp(token)
+            cookie_out = srv_cookie or cookie
+            exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)) if exp else "未知"
+            logger.info(f"[SubscribeSync] SA 登录成功，Token: {mask_secret(token)}，过期: {exp_str}")
+            return {"ok": True, "token": token, "exp": exp, "cookie": cookie_out}
+
+        return {"ok": False, "error": last_err}
+
+    def _ensure_sa_token(self) -> dict:
+        """确保有可用的 SA Token，过期则自动重新登录。"""
+        s = self._sa_session
+        token = s.get("token", "")
+        exp = s.get("token_exp")
+        cookie = s.get("cookie", "")
+        username = s.get("username", "") or self._sa_user
+        password = s.get("password", "") or self._sa_pass
+
+        now = int(time.time())
+        if token and exp and (exp - now) > 300:
+            return {"ok": True, "token": token, "cookie": cookie}
+
+        if not username or not password:
+            logger.warning("[SubscribeSync] SA 未配置账号密码，无法自动登录")
+            return {"ok": False, "error": "未配置 SA 账号密码"}
+
+        if not token:
+            logger.info("[SubscribeSync] 本地无有效 SA Token，准备自动登录...")
+        else:
+            exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp))
+            logger.info(f"[SubscribeSync] SA Token 即将过期（{exp_str}），自动重新登录...")
+
+        res = self._do_sa_login(username, password, cookie)
+        if not res["ok"]:
+            return {"ok": False, "error": res["error"]}
+
+        self._sa_session.update({
+            "token": res["token"],
+            "cookie": res["cookie"],
+            "token_exp": res["exp"],
+            "username": username,
+            "password": password,
+            "save_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        self._save_sa_session(self._sa_session)
+        return {"ok": True, "token": res["token"], "cookie": res["cookie"]}
+
+    # -------- 同步 MP 订阅 --------
+    def _sync_mp(self) -> dict:
+        """拉取源 MP 的订阅列表。"""
+        if not self._mp_token:
+            logger.error("[SubscribeSync] 未配置 MP API Token")
+            return {"error": "未配置 MP API Token", "total": 0, "users": [], "items": []}
+
+        logger.info("[SubscribeSync] 正在拉取 MP 订阅列表...")
+        url = f"{self._mp_base}/api/v1/subscribe/list?token={self._mp_token}"
+        try:
+            r = self._http_get(url, timeout=self._mp_timeout)
+        except Exception as e:
+            logger.error(f"[SubscribeSync] 拉取 MP 订阅失败：{e}")
+            return {"error": str(e), "total": 0, "users": [], "items": []}
+
+        if r.status_code == 401:
+            logger.error("[SubscribeSync] MP API Token 校验失败（401）")
+            return {"error": "API Token 校验失败", "total": 0, "users": [], "items": []}
+        if r.status_code != 200:
+            logger.error(f"[SubscribeSync] MP 接口返回 {r.status_code}")
+            return {"error": f"MP 返回 HTTP {r.status_code}", "total": 0, "users": [], "items": []}
+
+        try:
+            data = r.json()
+        except Exception:
+            logger.error("[SubscribeSync] MP 返回非 JSON 数据")
+            return {"error": "MP 返回非 JSON", "total": 0, "users": [], "items": []}
+
+        if isinstance(data, dict):
+            data = data.get("data", data.get("items", []))
+        if not isinstance(data, list):
+            data = []
+
+        items = []
+        for sub in data:
+            state = sub.get("state") or "N"
+            state_label, state_type = STATE_MAP.get(state, (state or "未知", "secondary"))
+            mtype = sub.get("type") or ""
+            type_label = TYPE_MAP.get(mtype, mtype or "未知")
+            total_ep = int(sub.get("total_episode") or 0)
+            lack_ep = int(sub.get("lack_episode") or 0)
+            got_ep = (total_ep - lack_ep) if total_ep else 0
+            items.append({
+                "id": sub.get("id"),
+                "name": sub.get("name") or "未知",
+                "year": sub.get("year") or "",
+                "type": type_label,
+                "raw_type": mtype,
+                "season": sub.get("season") or "",
+                "state": state,
+                "state_label": state_label,
+                "state_type": state_type,
+                "username": sub.get("username") or "默认",
+                "poster": normalize_poster(sub.get("poster")),
+                "backdrop": normalize_poster(sub.get("backdrop")),
+                "total_episode": total_ep,
+                "lack_episode": lack_ep,
+                "got_episode": got_ep,
+                "date": sub.get("date") or "",
+                "description": sub.get("description") or "",
+                "vote": sub.get("vote") or 0,
+                "tmdbid": str(sub.get("tmdbid") or ""),
+            })
+
+        # 分组
+        groups: Dict[str, list] = {}
+        for it in items:
+            groups.setdefault(it["username"], []).append(it)
+        users = [{"username": u, "count": len(v)} for u, v in groups.items()]
+
+        # 新订阅 TG 通知
+        if self._tg_token and self._tg_chat and self._notify_new:
+            old = self._cache.get("mp")
+            if old:
+                old_items = old.get("data", {}).get("items", [])
+                old_ids = {str(it.get("tmdbid") or "") for it in old_items}
+                old_ids.discard("")
+                for it in items:
+                    tid = str(it.get("tmdbid") or "")
+                    if tid and tid not in old_ids:
+                        self._tg_notify_new_sub(it)
+
+        self._cache["mp"] = {
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "data": {"items": items, "users": users, "source": self._mp_base},
+        }
+        self._save_cache()
+        logger.info(f"[SubscribeSync] MP 订阅已缓存（{len(items)} 条）")
+        return {"total": len(items), "source": self._mp_base, "users": users, "items": items}
+
+    # -------- 同步 SA 订阅 --------
+    def _sync_sa(self) -> dict:
+        """拉取 SA telegram 订阅任务列表。"""
+        auth = self._ensure_sa_token()
+        if not auth["ok"]:
+            return {"error": auth["error"], "total": 0, "items": []}
+
+        token = auth["token"]
+        cookie = auth["cookie"]
+        logger.info(f"[SubscribeSync] 正在请求 SA telegram 订阅（Token: {mask_secret(token)}）...")
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json, text/plain, */*",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+        }
+        if cookie:
+            headers["Cookie"] = cookie
+
+        try:
+            r = self._http_get(f"{self._sa_base}/api/v1/telegram_subscribe/tasks", headers=headers, timeout=self._sa_timeout)
+        except Exception as e:
+            logger.error(f"[SubscribeSync] SA 请求失败：{e}")
+            return {"error": str(e), "total": 0, "items": []}
+
+        # 401/403 自动重新登录重试
+        if r.status_code in (401, 403):
+            if is_cloudflare_challenge(r.text):
+                logger.error("[SubscribeSync] SA 被 Cloudflare 拦截")
+                return {"error": "被 Cloudflare 拦截", "total": 0, "items": []}
+            logger.warning(f"[SubscribeSync] SA 返回 {r.status_code}，尝试重新登录重试...")
+            res = self._do_sa_login(
+                self._sa_session.get("username", "") or self._sa_user,
+                self._sa_session.get("password", "") or self._sa_pass,
+                self._sa_session.get("cookie", ""),
+            )
+            if not res["ok"]:
+                return {"error": f"重登录失败：{res['error']}", "total": 0, "items": []}
+            self._sa_session.update({"token": res["token"], "cookie": res["cookie"], "token_exp": res["exp"]})
+            self._save_sa_session(self._sa_session)
+            headers["Authorization"] = f"Bearer {res['token']}"
+            if res["cookie"]:
+                headers["Cookie"] = res["cookie"]
+            try:
+                r = self._http_get(f"{self._sa_base}/api/v1/telegram_subscribe/tasks", headers=headers, timeout=self._sa_timeout)
+            except Exception as e:
+                logger.error(f"[SubscribeSync] SA 重试失败：{e}")
+                return {"error": str(e), "total": 0, "items": []}
+            if r.status_code in (401, 403):
+                logger.error(f"[SubscribeSync] SA 重试后仍被拒绝（{r.status_code}）")
+                return {"error": f"重试后仍被拒绝（{r.status_code}）", "total": 0, "items": []}
+
+        if r.status_code != 200:
+            logger.error(f"[SubscribeSync] SA 返回 {r.status_code}")
+            return {"error": f"SA 返回 HTTP {r.status_code}", "total": 0, "items": []}
+
+        try:
+            data = r.json()
+        except Exception:
+            logger.error("[SubscribeSync] SA 返回非 JSON")
+            return {"error": "SA 返回非 JSON", "total": 0, "items": []}
+
+        items = data.get("data") if isinstance(data, dict) else data
+        if isinstance(items, dict):
+            items = [items]
+        if not isinstance(items, list):
+            items = []
+        items = [self._normalize_sa_item(it) for it in items if isinstance(it, dict)]
+
+        self._cache["sa"] = {
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "data": {"items": items, "source": self._sa_base},
+        }
+        self._save_cache()
+        logger.info(f"[SubscribeSync] SA 订阅已缓存（{len(items)} 条）")
+        return {"total": len(items), "source": self._sa_base, "items": items}
+
+    def _normalize_sa_item(self, sub: dict) -> dict:
+        """将 SA 任务转换为与 MP 一致的字段结构。"""
+        state = sub.get("state") or "N"
+        state_label, state_type = STATE_MAP.get(state, (state or "未知", "secondary"))
+        mtype = sub.get("type") or ""
+        type_label = TYPE_MAP.get(mtype, mtype or "未知")
+        total_ep = int(sub.get("total_episode") or 0)
+        lack_ep = int(sub.get("lack_episode") or 0)
+        got_ep = (total_ep - lack_ep) if total_ep else 0
+        return {
+            "id": sub.get("id"),
+            "name": sub.get("name") or sub.get("title") or "未知",
+            "year": sub.get("year") or "",
+            "type": type_label,
+            "raw_type": mtype,
+            "season": sub.get("season") or "",
+            "state": state,
+            "state_label": state_label,
+            "state_type": state_type,
+            "username": sub.get("username") or "默认",
+            "poster": normalize_poster(sub.get("poster") or sub.get("poster_path") or sub.get("backdrop_path") or sub.get("backdrop")),
+            "backdrop": normalize_poster(sub.get("backdrop") or sub.get("backdrop_path")),
+            "total_episode": total_ep,
+            "lack_episode": lack_ep,
+            "got_episode": got_ep,
+            "date": sub.get("date") or sub.get("created") or "",
+            "description": sub.get("description") or sub.get("note") or "",
+            "vote": sub.get("vote") or 0,
+            "tmdbid": str(sub.get("tmdbid") or sub.get("tmdb_id") or ""),
+        }
+
+    # -------- 同步：MP → SA（电视剧查季集数，电影填模板） --------
+    def _build_filled_template(self, it: dict, kind: str, sa_data) -> dict:
+        """按模板填充一条订阅 JSON。"""
+        return {
+            "season_episode_count": sa_data if isinstance(sa_data, dict) else {},
+            "message_include_words": [],
+            "title": it.get("name") or it.get("title") or "",
+            "backdrop_path": normalize_poster(it.get("poster")),
+            "channel_type": "channel_115",
+            "overview": "",
+            "subscribe_url": "",
+            "transfered_episodes": [],
+            "parent_id": "3468594882933687738",
+            "poster_path": normalize_poster(it.get("backdrop")),
+            "end_words": "全集|完结|全\\\\d+集",
+            "last_update": "",
+            "year": int(it.get("year") or 0),
+            "type": kind,
+            "invalid_urls": [],
+            "rule_id": "7783544a-b426-469c-b4db-8a2454dbe661",
+            "id": "",
+            "season": 1,
+            "message_exclude_words": [],
+            "last_urls": [],
+            "start_episode": 1,
+            "channels": [
+                "hdhive_1", "Channel_Shares_115", "gimy115", "QukanMovie",
+                "oneonefivewpfx", "vip115hot", "ysxb48", "Movie888035",
+                "Lsp115", "yingshiziyuanpindao",
+            ],
+            "tmdbid": str(it.get("tmdbid") or it.get("tmdb_id") or ""),
+            "latest_episode": 0,
+            "total_episode_count": int(it.get("total_episode") or 0),
+            "rating": {},
+        }
+
+    def _query_sa_season_count(self, token: str, cookie: str, name: str, tvdbid) -> Optional[dict]:
+        """查询 SA 电视剧季集数。"""
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+        }
+        if cookie:
+            headers["Cookie"] = cookie
+        try:
+            r = self._http_get(
+                f"{self._sa_base}/api/v1/tmdbinfo/tmdb_tv_season_episode_count",
+                headers=headers,
+                params={"tmdbid": tvdbid},
+                timeout=self._sa_timeout,
+            )
+        except Exception as e:
+            logger.error(f"[SubscribeSync] 「{name}」(tvdbid={tvdbid}) 查询季集数失败：{e}")
+            return None
+        if r.status_code != 200:
+            logger.error(f"[SubscribeSync] 「{name}」(tvdbid={tvdbid}) 返回 {r.status_code}")
+            return None
+        try:
+            sa_data = r.json().get("data")
+        except Exception:
+            return None
+        if not sa_data:
+            logger.warning(f"[SubscribeSync] 「{name}」SA 未返回季集数")
+        return sa_data
+
+    def _sync(self) -> dict:
+        """同步：拉取 MP 订阅 → 查询 SA 季集数 / 电影填模板。"""
+        logger.info("[SubscribeSync] 开始同步（电视剧+电影）...")
+
+        if not self._mp_token:
+            return {"error": "未配置 MP API Token", "success": 0, "total": 0, "items": []}
+
+        # 1) 拉取 MP 订阅
+        try:
+            r = self._http_get(f"{self._mp_base}/api/v1/subscribe/list?token={self._mp_token}", timeout=self._mp_timeout)
+        except Exception as e:
+            logger.error(f"[SubscribeSync] 拉取 MP 订阅失败：{e}")
+            return {"error": str(e), "success": 0, "total": 0, "items": []}
+        if r.status_code != 200:
+            logger.error(f"[SubscribeSync] MP 接口返回 {r.status_code}")
+            return {"error": f"MP 返回 HTTP {r.status_code}", "success": 0, "total": 0, "items": []}
+        try:
+            mp_data = r.json()
+        except Exception:
+            return {"error": "MP 返回非 JSON", "success": 0, "total": 0, "items": []}
+        mp_items = mp_data.get("data") if isinstance(mp_data, dict) else mp_data
+        if not isinstance(mp_items, list):
+            mp_items = []
+
+        # 分类
+        tv_items, movie_items, other = [], [], 0
+        for it in mp_items:
+            kind = classify_type(it.get("type"))
+            if kind == "tv":
+                tv_items.append(it)
+            elif kind == "movie":
+                movie_items.append(it)
+            else:
+                other += 1
+        logger.info(
+            f"[SubscribeSync] MP 订阅共 {len(mp_items)} 条：电视剧 {len(tv_items)}，"
+            f"电影 {len(movie_items)}，跳过 {other}"
+        )
+
+        # 2) 获取 SA Token（仅电视剧需要）
+        token, cookie = "", ""
+        if tv_items:
+            auth = self._ensure_sa_token()
+            if not auth["ok"]:
+                return {"error": auth["error"], "success": 0, "total": 0, "items": []}
+            token = auth["token"]
+            cookie = auth["cookie"]
+
+        # 3) 处理每条订阅
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def process_one(it):
+            name = it.get("name") or it.get("title") or "未知"
+            kind = classify_type(it.get("type"))
+            if kind is None:
+                return None
+
+            sa_data = None
+            if kind == "tv":
+                tvdbid = it.get("tvdbid") or it.get("tvdb_id")
+                if not tvdbid:
+                    tvdbid = it.get("tmdbid") or it.get("tmdb_id")
+                    if not tvdbid:
+                        logger.warning(f"[SubscribeSync] 「{name}」无 tvdbid/tmdbid，跳过")
+                        return None
+                    logger.warning(f"[SubscribeSync] 「{name}」用 tmdbid={tvdbid} 回退")
+                sa_data = self._query_sa_season_count(token, cookie, name, tvdbid)
+
+            filled = self._build_filled_template(it, kind, sa_data)
+            return {
+                "name": name,
+                "poster": normalize_poster(it.get("poster")),
+                "backdrop": normalize_poster(it.get("backdrop")),
+                "year": it.get("year") or "",
+                "type": kind,
+                "tmdbid": str(it.get("tmdbid") or it.get("tmdb_id") or ""),
+                "json": filled,
+            }
+
+        results = []
+        with ThreadPoolExecutor(max_workers=self._sync_concurrency) as pool:
+            futures = {pool.submit(process_one, it): it for it in tv_items + movie_items}
+            for f in as_completed(futures):
+                try:
+                    rv = f.result()
+                    if rv:
+                        results.append(rv)
+                except Exception:
+                    pass
+
+        ok = len(results)
+        total = len(tv_items) + len(movie_items)
+        self._cache["sync"] = {
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "data": {"success": ok, "total": total, "items": results},
+        }
+        self._save_cache()
+        logger.info(f"[SubscribeSync] 同步完成：{ok}/{total} 条")
+        return {"success": ok, "total": total, "items": results}
+
+    # -------- mp同步sa：对比并推送 --------
+    def _mp_sync_sa(self) -> dict:
+        """对比 MP 与 SA 订阅（按 tmdbid）：
+        - SA 已有 → 取消 MP 订阅
+        - MP 有而 SA 无 → 推送到 SA
+        """
+        logger.info("[SubscribeSync] 开始 mp同步sa ...")
+
+        if not self._mp_token:
+            return {"error": "未配置 MP API Token", "success": True, "cancel": 0, "cancel_total": 0, "add": 0, "add_total": 0}
+
+        # 1) 拉取 MP 订阅
+        try:
+            r = self._http_get(f"{self._mp_base}/api/v1/subscribe/list?token={self._mp_token}", timeout=self._mp_timeout)
+        except Exception as e:
+            logger.error(f"[SubscribeSync] 拉取 MP 订阅失败：{e}")
+            return {"error": str(e), "success": False}
+        if r.status_code != 200:
+            return {"error": f"MP 返回 {r.status_code}", "success": False}
+        try:
+            mp_data = r.json()
+        except Exception:
+            return {"error": "MP 返回非 JSON", "success": False}
+        mp_items = mp_data.get("data") if isinstance(mp_data, dict) else mp_data
+        if not isinstance(mp_items, list):
+            mp_items = []
+        if not mp_items:
+            logger.warning("[SubscribeSync] MP 无订阅，跳过")
+            return {"success": True, "cancel": 0, "cancel_total": 0, "add": 0, "add_total": 0}
+
+        # 2) 拉取 SA 订阅
+        auth = self._ensure_sa_token()
+        if not auth["ok"]:
+            return {"error": auth["error"], "success": False}
+        token = auth["token"]
+        cookie = auth["cookie"]
+
+        sa_items = self._fetch_sa_tasks(token, cookie)
+        if sa_items is None:
+            return {"error": "拉取 SA 任务失败", "success": False}
+
+        sa_tmdbids = {str(it.get("tmdbid") or "") for it in sa_items if it.get("tmdbid")}
+        sa_tmdbids.discard("")
+
+        # 3) 分类
+        to_cancel, to_add, skipped = [], [], []
+        for mp in mp_items:
+            t = str(mp.get("tmdbid") or mp.get("tmdb_id") or "")
+            if not t:
+                skipped.append(mp.get("name") or "未知")
+                continue
+            if t in sa_tmdbids:
+                to_cancel.append(mp)
+            else:
+                to_add.append(mp)
+
+        logger.info(
+            f"[SubscribeSync] 比对结果：MP {len(mp_items)} 条，"
+            f"SA已有 {len(to_cancel)} 条（取消MP），"
+            f"MP独有 {len(to_add)} 条（推送SA），跳过 {len(skipped)}"
+        )
+
+        # 4) 取消 MP 订阅
+        cancel_ok, cancel_fail = [], []
+        for mp in to_cancel:
+            name = mp.get("name") or mp.get("title") or "未知"
+            sub_id = mp.get("id")
+            tmdbid = str(mp.get("tmdbid") or mp.get("tmdb_id") or "")
+            logger.info(f"[SubscribeSync] 取消 MP 订阅：{name}（SA 已有）")
+            sc = self._mp_delete_subscribe(sub_id, tmdbid)
+            if sc in (200, 204):
+                cancel_ok.append(name)
+                logger.info(f"[SubscribeSync] ✓ 已取消 MP 订阅：{name}")
+            else:
+                cancel_fail.append(name)
+                logger.error(f"[SubscribeSync] ✗ 取消失败：{name}（{sc}）")
+
+        # 5) 推送 SA
+        add_ok, add_fail, add_skip = [], [], []
+        if to_add:
+            save_headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/plain, */*",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Dest": "empty",
+            }
+            if cookie:
+                save_headers["Cookie"] = cookie
+
+            for i, it in enumerate(to_add, 1):
+                name = it.get("name") or it.get("title") or "未知"
+                kind = classify_type(it.get("type"))
+                if kind is None:
+                    add_skip.append(name)
+                    continue
+
+                logger.info(f"[SubscribeSync] ({i}/{len(to_add)}) 推送「{name}」({kind}) ...")
+
+                sa_data = None
+                if kind == "tv":
+                    tvdbid = it.get("tvdbid") or it.get("tvdb_id")
+                    if not tvdbid:
+                        tvdbid = str(it.get("tmdbid") or it.get("tmdb_id") or "")
+                    if tvdbid:
+                        sa_data = self._query_sa_season_count(token, cookie, name, tvdbid)
+
+                filled = self._build_filled_template(it, kind, sa_data)
+
+                try:
+                    r = self._http_post(
+                        f"{self._sa_base}/api/v1/telegram_subscribe/save_telegram_subscribe_task",
+                        headers=save_headers,
+                        json_data=filled,
+                        timeout=self._sa_timeout,
+                    )
+                except Exception as e:
+                    add_fail.append(name)
+                    logger.error(f"[SubscribeSync] 推送「{name}」异常：{e}")
+                    continue
+
+                if r.status_code in (200, 201):
+                    add_ok.append(name)
+                    logger.info(f"[SubscribeSync] ✓ 已推送 SA：{name}")
+                else:
+                    add_fail.append(name)
+                    logger.error(f"[SubscribeSync] ✗ 推送 SA 失败：{name} ({r.status_code})")
+
+        # 汇总日志
+        lines = ["=" * 50, "mp同步sa 汇总", "=" * 50]
+        if to_cancel:
+            lines.append(f"取消 MP 订阅：{len(cancel_ok)}/{len(to_cancel)}")
+            if cancel_ok:
+                lines.append("  成功：" + "、".join(cancel_ok))
+            if cancel_fail:
+                lines.append("  失败：" + "、".join(cancel_fail))
+        else:
+            lines.append("取消 MP 订阅：无")
+        if skipped:
+            lines.append(f"跳过（无tmdbid）{len(skipped)}：" + "、".join(skipped))
+        add_attempted = len(to_add) - len(add_skip)
+        lines.append(f"推送 SA：{len(add_ok)}/{add_attempted}")
+        if add_ok:
+            lines.append("  成功：" + "、".join(add_ok))
+        if add_fail:
+            lines.append("  失败：" + "、".join(add_fail))
+        if add_skip:
+            lines.append("  跳过：" + "、".join(add_skip))
+        lines.append("=" * 50)
+        for line in lines:
+            logger.info(f"[SubscribeSync] {line}")
+
+        return {
+            "success": True,
+            "cancel": len(cancel_ok), "cancel_total": len(to_cancel),
+            "cancel_ok": cancel_ok, "cancel_fail": cancel_fail,
+            "add": len(add_ok), "add_total": len(to_add),
+            "add_ok": add_ok, "add_fail": add_fail, "add_skip": add_skip,
+            "skipped": skipped,
+        }
+
+    def _fetch_sa_tasks(self, token: str, cookie: str) -> Optional[List[dict]]:
+        """拉取 SA telegram 订阅任务列表（简化版）。"""
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json, text/plain, */*",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+        }
+        if cookie:
+            headers["Cookie"] = cookie
+        try:
+            r = self._http_get(f"{self._sa_base}/api/v1/telegram_subscribe/tasks", headers=headers, timeout=self._sa_timeout)
+        except Exception as e:
+            logger.error(f"[SubscribeSync] 拉取 SA 任务失败：{e}")
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            data = r.json()
+        except Exception:
+            return None
+        items = data.get("data") if isinstance(data, dict) else data
+        if isinstance(items, dict):
+            items = [items]
+        if not isinstance(items, list):
+            items = []
+        return [self._normalize_sa_item(it) for it in items if isinstance(it, dict)]
+
+    def _mp_delete_subscribe(self, sub_id, tmdbid: str) -> int:
+        """调用 MoviePilot 删除订阅，返回状态码。"""
+        if sub_id:
+            try:
+                r = self._http_delete(
+                    f"{self._mp_base}/api/v1/subscribe/{sub_id}?token={self._mp_token}",
+                    headers={"Accept": "application/json"},
+                    timeout=self._mp_timeout,
+                )
+                if r.status_code in (200, 204):
+                    return r.status_code
+            except Exception:
+                pass
+        if tmdbid:
+            try:
+                r = self._http_delete(
+                    f"{self._mp_base}/api/v1/subscribe/media/tmdb:{tmdbid}?token={self._mp_token}",
+                    headers={"Accept": "application/json"},
+                    timeout=self._mp_timeout,
+                )
+                return r.status_code
+            except Exception:
+                pass
+        return 404
+
+    # -------- 任务序列 --------
+    def _run_sequence(self):
+        """按顺序执行全部任务。"""
+        self._reload_config()
+        logger.info("[SubscribeSync] ▶ 开始执行任务序列")
+        results = []
+        task_map = {
+            "mp": ("同步 MP 订阅", self._sync_mp),
+            "sa": ("同步 SA 订阅", self._sync_sa),
+            "sync": ("开始同步", self._sync),
+            "mp_sync_sa": ("mp同步sa", self._mp_sync_sa),
+        }
+
+        for key in self._task_order:
+            if not self._enabled_tasks.get(key, True):
+                logger.info(f"[SubscribeSync] 任务「{key}」已禁用，跳过")
+                results.append((key, "跳过"))
+                continue
+            try:
+                task_map[key][1]()
+                logger.info(f"[SubscribeSync] ✓ 任务「{key}」完成")
+                results.append((key, "成功"))
+            except Exception as e:
+                logger.error(f"[SubscribeSync] ✗ 任务「{key}」失败：{e}")
+                results.append((key, f"失败：{e}"))
+
+        logger.info("[SubscribeSync] ✓ 任务序列执行完毕")
+        self._tg_seq_summary(results)
+
+    def _tg_seq_summary(self, results):
+        """发送 TG 任务序列汇总。"""
+        if not self._tg_token or not self._tg_chat:
+            return
+        task_names = {"mp": "同步 MP", "sa": "同步 SA", "sync": "开始同步", "mp_sync_sa": "mp同步sa"}
+        lines = ["📋 <b>任务序列执行完毕</b>"]
+        for key, status in results:
+            label = task_names.get(key, key)
+            if status == "跳过":
+                lines.append(f"⏭ {label}：已禁用")
+            elif status.startswith("失败"):
+                lines.append(f"❌ {label}：{status}")
+            else:
+                lines.append(f"✅ {label}：完成")
+        self._tg_send_text("\n".join(lines))
+
+    # -------- Telegram --------
+    def _tg_api_url(self, method: str) -> str:
+        return f"https://api.telegram.org/bot{self._tg_token}/{method}"
+
+    def _tg_send_text(self, text: str):
+        """发送 Telegram 文本消息。"""
+        if not self._tg_token or not self._tg_chat:
+            return
+        try:
+            self._http_post(
+                self._tg_api_url("sendMessage"),
+                json_data={
+                    "chat_id": self._tg_chat,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+                timeout=15,
+            )
+        except Exception as e:
+            logger.warning(f"[SubscribeSync] TG 消息发送失败：{e}")
+
+    def _tg_send_photo(self, photo_url: str, caption: str):
+        """发送 Telegram 图片消息。"""
+        if not self._tg_token or not self._tg_chat:
+            return
+        try:
+            self._http_post(
+                self._tg_api_url("sendPhoto"),
+                json_data={
+                    "chat_id": self._tg_chat,
+                    "photo": photo_url,
+                    "caption": caption,
+                    "parse_mode": "HTML",
+                },
+                timeout=15,
+            )
+        except Exception as e:
+            logger.warning(f"[SubscribeSync] TG 图片发送失败：{e}")
+
+    def _tg_notify_new_sub(self, it: dict):
+        """新订阅 TG 通知。"""
+        name = it.get("name") or it.get("title") or "未知"
+        year = str(it.get("year") or "")
+        mtype = it.get("type") or ""
+        tmdbid = str(it.get("tmdbid") or it.get("tmdb_id") or "")
+        desc = (it.get("description") or "")[:200]
+        poster = it.get("poster") or ""
+
+        caption = (
+            f"🆕 <b>新订阅</b>\n"
+            f"<b>{name}</b> ({year})\n"
+            f"类型：{mtype}　 tmdbid：{tmdbid}"
+        )
+        if desc:
+            caption += f"\n简介：{desc}"
+        if poster and (poster.startswith("http://") or poster.startswith("https://")):
+            self._tg_send_photo(poster, caption)
+        else:
+            self._tg_send_text(caption)
+
+    # -------- API 端点处理函数 --------
+
+    def _api_sync_mp(self, **kwargs) -> dict:
+        """API：同步 MP 订阅。"""
+        self._reload_config()
+        result = self._sync_mp()
+        self._tg_send_text(f"✅ <b>同步 MP 订阅</b> 完成\n共 {result.get('total', 0)} 条")
+        return {"success": True, "data": result}
+
+    def _api_sync_sa(self, **kwargs) -> dict:
+        """API：同步 SA 订阅。"""
+        self._reload_config()
+        result = self._sync_sa()
+        total = result.get("total", 0)
+        self._tg_send_text(f"✅ <b>同步 SA 订阅</b> 完成\n共 {total} 条，来源：{result.get('source', '')}")
+        return {"success": True, "data": result}
+
+    def _api_sync(self, **kwargs) -> dict:
+        """API：开始同步。"""
+        self._reload_config()
+        result = self._sync()
+        ok = result.get("success", 0)
+        total = result.get("total", 0)
+        self._tg_send_text(
+            f"✅ <b>开始同步</b> 完成\n"
+            f"成功 {ok} / 共 {total} 条"
+        )
+        return {"success": True, "data": result}
+
+    def _api_mp_sync_sa(self, **kwargs) -> dict:
+        """API：mp同步sa。"""
+        self._reload_config()
+        result = self._mp_sync_sa()
+        cancel = result.get("cancel", 0)
+        cancel_total = result.get("cancel_total", 0)
+        add = result.get("add", 0)
+        add_total = result.get("add_total", 0)
+        lines = [
+            f"✅ <b>mp同步sa</b> 完成",
+            f"取消 MP 订阅：{cancel}/{cancel_total}",
+            f"推送 SA：{add}/{add_total}",
+        ]
+        cancel_ok = result.get("cancel_ok") or []
+        cancel_fail = result.get("cancel_fail") or []
+        if cancel_ok:
+            lines.append("取消成功：" + "、".join(cancel_ok))
+        if cancel_fail:
+            lines.append("取消失败：" + "、".join(cancel_fail))
+        add_ok = result.get("add_ok") or []
+        add_fail = result.get("add_fail") or []
+        if add_ok:
+            lines.append("推送成功：" + "、".join(add_ok))
+        if add_fail:
+            lines.append("推送失败：" + "、".join(add_fail))
+        self._tg_send_text("\n".join(lines))
+        return {"success": True, "data": result}
+
+    def _api_run_sequence(self, **kwargs) -> dict:
+        """API：执行任务序列（异步启动）。"""
+        t = threading.Thread(target=self._run_sequence, daemon=True)
+        t.start()
+        return {"success": True, "message": "任务序列已在后台启动"}
+
+    def _api_data_mp(self, **kwargs) -> dict:
+        """API：获取 MP 缓存数据。"""
+        if self._cache.get("mp") is None:
+            self._load_cache()
+        c = self._cache.get("mp")
+        if c is None:
+            return {"items": [], "users": [], "source": "", "updated_at": None}
+        return {
+            "items": c["data"]["items"],
+            "users": c["data"]["users"],
+            "source": c["data"]["source"],
+            "updated_at": c["updated_at"],
+        }
+
+    def _api_data_sa(self, **kwargs) -> dict:
+        """API：获取 SA 缓存数据。"""
+        if self._cache.get("sa") is None:
+            self._load_cache()
+        c = self._cache.get("sa")
+        if c is None:
+            return {"items": [], "source": "", "updated_at": None}
+        return {
+            "items": c["data"]["items"],
+            "source": c["data"]["source"],
+            "updated_at": c["updated_at"],
+        }
+
+    def _api_data_sync(self, **kwargs) -> dict:
+        """API：获取同步缓存数据。"""
+        if self._cache.get("sync") is None:
+            self._load_cache()
+        c = self._cache.get("sync")
+        if c is None:
+            return {"success": 0, "total": 0, "items": [], "updated_at": None}
+        return {
+            "success": c["data"]["success"],
+            "total": c["data"]["total"],
+            "items": c["data"]["items"],
+            "updated_at": c["updated_at"],
+        }
+
+    def _api_sa_status(self, **kwargs) -> dict:
+        """API：SA 登录状态。"""
+        s = self._sa_session
+        if s.get("token"):
+            exp = s.get("token_exp")
+            exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)) if exp else "未知"
+            return {
+                "logged_in": True,
+                "username": s.get("username") or self._sa_user,
+                "token_masked": mask_secret(s.get("token", "")),
+                "token_exp": exp_str,
+                "save_time": s.get("save_time"),
+            }
+        return {"logged_in": False, "has_env": bool(self._sa_user and self._sa_pass)}
+
+    def _api_sa_login(self, **kwargs) -> dict:
+        """API：手动 SA 登录。"""
+        username = (kwargs.get("username") or self._sa_user or "").strip()
+        password = kwargs.get("password") or self._sa_pass or ""
+        cookie = (kwargs.get("cookie") or self._sa_cookie or "").strip()
+
+        if not username or not password:
+            return {"success": False, "message": "账号和密码不能为空"}
+
+        res = self._do_sa_login(username, password, cookie)
+        if not res["ok"]:
+            return {"success": False, "message": res["error"]}
+
+        self._sa_session.update({
+            "token": res["token"],
+            "cookie": res["cookie"],
+            "token_exp": res["exp"],
+            "username": username,
+            "password": password,
+            "save_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        self._save_sa_session(self._sa_session)
+        return {"success": True, "message": "登录成功", "username": username}
+
+    def _api_sa_logout(self, **kwargs) -> dict:
+        """API：SA 登出。"""
+        self._sa_session = {}
+        self._save_sa_session(self._sa_session)
+        return {"success": True, "message": "已登出"}
+
+    def _api_mp_unsubscribe(self, **kwargs) -> dict:
+        """API：取消 MP 订阅。"""
+        sub_id = kwargs.get("id")
+        tmdbid = str(kwargs.get("tmdbid") or "")
+        name = (kwargs.get("name") or "").strip()
+
+        if not sub_id and not tmdbid:
+            return {"success": False, "message": "缺少订阅标识"}
+
+        if not self._mp_token:
+            return {"success": False, "message": "未配置 MP API Token"}
+
+        # 按 id 删除
+        if sub_id:
+            try:
+                r = self._http_delete(
+                    f"{self._mp_base}/api/v1/subscribe/{sub_id}?token={self._mp_token}",
+                    headers={"Accept": "application/json"},
+                    timeout=self._mp_timeout,
+                )
+                if r.status_code in (200, 204):
+                    logger.info(f"[SubscribeSync] 已取消 MP 订阅：{name}（id={sub_id}）")
+                    return {"success": True, "message": f"已取消：{name}"}
+            except Exception as e:
+                logger.warning(f"[SubscribeSync] 按 id 取消失败：{e}")
+
+        # 按媒体 id 删除
+        if tmdbid:
+            try:
+                r = self._http_delete(
+                    f"{self._mp_base}/api/v1/subscribe/media/tmdb:{tmdbid}?token={self._mp_token}",
+                    headers={"Accept": "application/json"},
+                    timeout=self._mp_timeout,
+                )
+                if r.status_code in (200, 204):
+                    logger.info(f"[SubscribeSync] 已取消 MP 订阅：{name}（tmdbid={tmdbid}）")
+                    return {"success": True, "message": f"已取消：{name}"}
+            except Exception as e:
+                logger.error(f"[SubscribeSync] 按媒体 id 取消失败：{e}")
+
+        return {"success": False, "message": f"取消失败"}
