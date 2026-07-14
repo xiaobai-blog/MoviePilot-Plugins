@@ -108,7 +108,7 @@ def is_cloudflare_challenge(text: str) -> bool:
 class SubscribeSync(_PluginBase):
     # 插件元数据
     plugin_name = "订阅同步"
-    plugin_version = "1.5.5"
+    plugin_version = "1.5.6"
     plugin_author = "AutoBuilder"
     author_url = "https://github.com"
     plugin_description = (
@@ -1409,7 +1409,7 @@ class SubscribeSync(_PluginBase):
 
     # -------- 同步：MP → SA（电视剧查季集数，电影填模板） --------
     def _build_filled_template(self, it: dict, kind: str, sa_data) -> dict:
-        """按模板填充一条订阅 JSON。"""
+        """按模板填充一条订阅 JSON（字段与 Docker 版 app.py 完全对齐）。"""
         return {
             "season_episode_count": sa_data if isinstance(sa_data, dict) else {},
             "message_include_words": [],
@@ -1421,7 +1421,7 @@ class SubscribeSync(_PluginBase):
             "transfered_episodes": [],
             "parent_id": "3468594882933687738",
             "poster_path": normalize_poster(it.get("backdrop")),
-            "end_words": "全集|完结|全\\\\d+集",
+            "end_words": "全集|完结|全\\d+集",
             "last_update": "",
             "year": int(it.get("year") or 0),
             "type": kind,
@@ -1707,12 +1707,34 @@ class SubscribeSync(_PluginBase):
                         logger.error(f"[SubscribeSync] 重登录失败：{res['error']}")
 
                 resp_body = r.text or ""
-                if r.status_code in (200, 201):
-                    add_ok.append(name)
-                    logger.info(f"[SubscribeSync] ✓ 已推送 SA：{name}，SA 响应：{resp_body}")
-                else:
+                # 先判断 HTTP 状态
+                if r.status_code not in (200, 201):
                     add_fail.append(name)
                     logger.error(f"[SubscribeSync] ✗ 推送 SA 失败：{name}（HTTP {r.status_code}）：{resp_body}")
+                    continue
+                # 再判断 SA 返回的 body（SA 可能 200 但 body 里 success=false）
+                try:
+                    resp_json = json.loads(resp_body) if resp_body else {}
+                except Exception:
+                    resp_json = {}
+                sa_success = resp_json.get("success")
+                sa_code = resp_json.get("code")
+                sa_msg = resp_json.get("msg") or resp_json.get("message") or resp_json.get("detail") or ""
+                resp_data = resp_json.get("data")
+                if sa_success is False or (isinstance(sa_code, int) and sa_code not in (0, 200, 201)):
+                    add_fail.append(name)
+                    logger.error(
+                        f"[SubscribeSync] ✗ 推送 SA 被 SA 拒绝：{name}，"
+                        f"success={sa_success} code={sa_code} msg={sa_msg} body={resp_body[:500]}"
+                    )
+                    continue
+                # 成功：SA 返回的新任务里应带有 id
+                new_id = (resp_data or {}).get("id") if isinstance(resp_data, dict) else None
+                add_ok.append(name)
+                logger.info(
+                    f"[SubscribeSync] ✓ 已推送 SA：{name}，SA 新任务 id={new_id or '未知'}，"
+                    f"完整响应：{resp_body}"
+                )
 
         # 推送后验证：重新拉取 SA 任务，检查数量变化
         logger.info(f"[SubscribeSync] 推送前 SA 任务数 = {sa_before_count}，推送成功 = {len(add_ok)}，重新拉取验证...")
