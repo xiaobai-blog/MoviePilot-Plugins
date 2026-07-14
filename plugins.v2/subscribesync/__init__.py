@@ -107,7 +107,7 @@ def is_cloudflare_challenge(text: str) -> bool:
 class SubscribeSync(_PluginBase):
     # 插件元数据
     plugin_name = "订阅同步"
-    plugin_version = "1.0.0"
+    plugin_version = "1.2.0"
     plugin_author = "AutoBuilder"
     author_url = "https://github.com"
     plugin_description = (
