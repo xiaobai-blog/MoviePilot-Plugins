@@ -107,7 +107,7 @@ def is_cloudflare_challenge(text: str) -> bool:
 class SubscribeSync(_PluginBase):
     # 插件元数据
     plugin_name = "订阅同步"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "AutoBuilder"
     author_url = "https://github.com"
     plugin_description = (
@@ -151,7 +151,11 @@ class SubscribeSync(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         """初始化插件：读取配置、加载持久化数据。"""
-        self._config = config or self.default_config()
+        # 防止配置为空导致覆盖已有配置
+        if not config:
+            stored = self.get_config()
+            config = stored if stored else self.default_config()
+        self._config = config
 
         self._mp_base = self._config.get("mp_base_url", "").rstrip("/")
         self._mp_token = self._config.get("mp_api_token", "")
@@ -184,27 +188,40 @@ class SubscribeSync(_PluginBase):
         self._load_cache()
         logger.info(f"[SubscribeSync] 插件初始化完成，启用状态: {self._enabled}")
 
-        # 处理手动触发开关
-        if self._config.get("run_sync_mp"):
-            logger.info("[SubscribeSync] 手动触发：同步 MP 订阅")
-            threading.Thread(target=self._sync_mp, daemon=True).start()
-        if self._config.get("run_sync_sa"):
-            logger.info("[SubscribeSync] 手动触发：同步 SA 订阅")
-            threading.Thread(target=self._sync_sa, daemon=True).start()
-        if self._config.get("run_sync"):
-            logger.info("[SubscribeSync] 手动触发：开始同步")
-            threading.Thread(target=self._sync, daemon=True).start()
-        if self._config.get("run_mp_sync_sa"):
-            logger.info("[SubscribeSync] 手动触发：mp同步sa")
-            threading.Thread(target=self._mp_sync_sa, daemon=True).start()
+        # 处理手动触发开关（任务完成后自动重置）
+        triggers = {
+            "run_sync_mp": ("同步 MP 订阅", self._sync_mp),
+            "run_sync_sa": ("同步 SA 订阅", self._sync_sa),
+            "run_sync": ("开始同步", self._sync),
+            "run_mp_sync_sa": ("mp同步sa", self._mp_sync_sa),
+        }
+        for key, (label, func) in triggers.items():
+            if self._config.get(key):
+                logger.info(f"[SubscribeSync] 手动触发：{label}")
+                self._start_manual_task(key, label, func)
 
-        # 重置手动触发开关
-        if any(self._config.get(k) for k in ("run_sync_mp", "run_sync_sa", "run_sync", "run_mp_sync_sa")):
-            self._config["run_sync_mp"] = False
-            self._config["run_sync_sa"] = False
-            self._config["run_sync"] = False
-            self._config["run_mp_sync_sa"] = False
-            self.update_config(self._config)
+    def _start_manual_task(self, key: str, label: str, func):
+        """启动手动任务并在完成后重置开关。"""
+        def _run():
+            try:
+                func()
+            except Exception as e:
+                logger.error(f"[SubscribeSync] 手动任务「{label}」异常：{e}")
+            finally:
+                self._reset_switch(key)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _reset_switch(self, key: str):
+        """仅重置单个开关字段，不覆盖其他配置。"""
+        try:
+            stored = self.get_config() or {}
+            stored[key] = False
+            self.update_config(stored)
+            self._config[key] = False
+            logger.info(f"[SubscribeSync] 手动触发开关 {key} 已重置")
+        except Exception as e:
+            logger.warning(f"[SubscribeSync] 重置开关 {key} 失败：{e}")
 
     def get_state(self) -> bool:
         return self._enabled
@@ -1165,7 +1182,7 @@ class SubscribeSync(_PluginBase):
                 for it in items:
                     tid = str(it.get("tmdbid") or "")
                     if tid and tid not in old_ids:
-                        self._tg_notify_new_sub(it)
+                        self._new_sub_notify(it)
 
         self._cache["mp"] = {
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1689,14 +1706,56 @@ class SubscribeSync(_PluginBase):
                 results.append((key, f"失败：{e}"))
 
         logger.info("[SubscribeSync] ✓ 任务序列执行完毕")
-        self._tg_seq_summary(results)
+        self._seq_summary(results)
 
-    def _tg_seq_summary(self, results):
-        """发送 TG 任务序列汇总。"""
+    # -------- 消息通知（优先 MP 内置通道，独立 TG Bot 作降级） --------
+    def _notify(self, title: str, text: str, image: str = ""):
+        """发送通知：优先通过 MP 配置的通道，回退到独立 Telegram Bot。"""
+        # 1) 优先使用 MP 内置消息通道
+        try:
+            self.post_message(
+                mtype=NotificationType.Plugin,
+                title=title,
+                text=text,
+                image=image,
+            )
+            return
+        except Exception as e:
+            logger.debug(f"[SubscribeSync] MP 内置通知发送失败：{e}")
+
+        # 2) 降级到独立 Telegram Bot（如果配置了的话）
         if not self._tg_token or not self._tg_chat:
             return
+        try:
+            if image and (image.startswith("http://") or image.startswith("https://")):
+                self._http_post(
+                    f"https://api.telegram.org/bot{self._tg_token}/sendPhoto",
+                    json_data={
+                        "chat_id": self._tg_chat,
+                        "photo": image,
+                        "caption": text,
+                        "parse_mode": "HTML",
+                    },
+                    timeout=15,
+                )
+            else:
+                self._http_post(
+                    f"https://api.telegram.org/bot{self._tg_token}/sendMessage",
+                    json_data={
+                        "chat_id": self._tg_chat,
+                        "text": text,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=15,
+                )
+        except Exception as e:
+            logger.warning(f"[SubscribeSync] TG Bot 通知发送失败：{e}")
+
+    def _seq_summary(self, results):
+        """发送任务序列汇总通知。"""
         task_names = {"mp": "同步 MP", "sa": "同步 SA", "sync": "开始同步", "mp_sync_sa": "mp同步sa"}
-        lines = ["📋 <b>任务序列执行完毕</b>"]
+        lines = ["📋 任务序列执行完毕"]
         for key, status in results:
             label = task_names.get(key, key)
             if status == "跳过":
@@ -1705,50 +1764,10 @@ class SubscribeSync(_PluginBase):
                 lines.append(f"❌ {label}：{status}")
             else:
                 lines.append(f"✅ {label}：完成")
-        self._tg_send_text("\n".join(lines))
+        self._notify("订阅同步 - 任务序列", "\n".join(lines))
 
-    # -------- Telegram --------
-    def _tg_api_url(self, method: str) -> str:
-        return f"https://api.telegram.org/bot{self._tg_token}/{method}"
-
-    def _tg_send_text(self, text: str):
-        """发送 Telegram 文本消息。"""
-        if not self._tg_token or not self._tg_chat:
-            return
-        try:
-            self._http_post(
-                self._tg_api_url("sendMessage"),
-                json_data={
-                    "chat_id": self._tg_chat,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-                timeout=15,
-            )
-        except Exception as e:
-            logger.warning(f"[SubscribeSync] TG 消息发送失败：{e}")
-
-    def _tg_send_photo(self, photo_url: str, caption: str):
-        """发送 Telegram 图片消息。"""
-        if not self._tg_token or not self._tg_chat:
-            return
-        try:
-            self._http_post(
-                self._tg_api_url("sendPhoto"),
-                json_data={
-                    "chat_id": self._tg_chat,
-                    "photo": photo_url,
-                    "caption": caption,
-                    "parse_mode": "HTML",
-                },
-                timeout=15,
-            )
-        except Exception as e:
-            logger.warning(f"[SubscribeSync] TG 图片发送失败：{e}")
-
-    def _tg_notify_new_sub(self, it: dict):
-        """新订阅 TG 通知。"""
+    def _new_sub_notify(self, it: dict):
+        """新订阅通知。"""
         name = it.get("name") or it.get("title") or "未知"
         year = str(it.get("year") or "")
         mtype = it.get("type") or ""
@@ -1756,17 +1775,14 @@ class SubscribeSync(_PluginBase):
         desc = (it.get("description") or "")[:200]
         poster = it.get("poster") or ""
 
-        caption = (
-            f"🆕 <b>新订阅</b>\n"
-            f"<b>{name}</b> ({year})\n"
-            f"类型：{mtype}　 tmdbid：{tmdbid}"
+        text = (
+            f"🆕 新订阅\n"
+            f"{name} ({year})\n"
+            f"类型：{mtype}  tmdbid：{tmdbid}"
         )
         if desc:
-            caption += f"\n简介：{desc}"
-        if poster and (poster.startswith("http://") or poster.startswith("https://")):
-            self._tg_send_photo(poster, caption)
-        else:
-            self._tg_send_text(caption)
+            text += f"\n简介：{desc}"
+        self._notify("订阅同步 - 新订阅", text, poster)
 
     # -------- API 端点处理函数 --------
 
@@ -1774,7 +1790,7 @@ class SubscribeSync(_PluginBase):
         """API：同步 MP 订阅。"""
         self._reload_config()
         result = self._sync_mp()
-        self._tg_send_text(f"✅ <b>同步 MP 订阅</b> 完成\n共 {result.get('total', 0)} 条")
+        self._notify("订阅同步", f"✅ 同步 MP 订阅 完成\n共 {result.get('total', 0)} 条")
         return {"success": True, "data": result}
 
     def _api_sync_sa(self, **kwargs) -> dict:
@@ -1782,7 +1798,7 @@ class SubscribeSync(_PluginBase):
         self._reload_config()
         result = self._sync_sa()
         total = result.get("total", 0)
-        self._tg_send_text(f"✅ <b>同步 SA 订阅</b> 完成\n共 {total} 条，来源：{result.get('source', '')}")
+        self._notify("订阅同步", f"✅ 同步 SA 订阅 完成\n共 {total} 条，来源：{result.get('source', '')}")
         return {"success": True, "data": result}
 
     def _api_sync(self, **kwargs) -> dict:
@@ -1791,10 +1807,7 @@ class SubscribeSync(_PluginBase):
         result = self._sync()
         ok = result.get("success", 0)
         total = result.get("total", 0)
-        self._tg_send_text(
-            f"✅ <b>开始同步</b> 完成\n"
-            f"成功 {ok} / 共 {total} 条"
-        )
+        self._notify("订阅同步", f"✅ 开始同步 完成\n成功 {ok} / 共 {total} 条")
         return {"success": True, "data": result}
 
     def _api_mp_sync_sa(self, **kwargs) -> dict:
@@ -1806,7 +1819,7 @@ class SubscribeSync(_PluginBase):
         add = result.get("add", 0)
         add_total = result.get("add_total", 0)
         lines = [
-            f"✅ <b>mp同步sa</b> 完成",
+            f"✅ mp同步sa 完成",
             f"取消 MP 订阅：{cancel}/{cancel_total}",
             f"推送 SA：{add}/{add_total}",
         ]
@@ -1822,7 +1835,7 @@ class SubscribeSync(_PluginBase):
             lines.append("推送成功：" + "、".join(add_ok))
         if add_fail:
             lines.append("推送失败：" + "、".join(add_fail))
-        self._tg_send_text("\n".join(lines))
+        self._notify("订阅同步", "\n".join(lines))
         return {"success": True, "data": result}
 
     def _api_run_sequence(self, **kwargs) -> dict:
