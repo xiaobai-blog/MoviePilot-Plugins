@@ -108,7 +108,7 @@ def is_cloudflare_challenge(text: str) -> bool:
 class SubscribeSync(_PluginBase):
     # 插件元数据
     plugin_name = "订阅同步"
-    plugin_version = "1.5.7"
+    plugin_version = "1.5.8"
     plugin_author = "AutoBuilder"
     author_url = "https://github.com"
     plugin_description = (
@@ -1713,20 +1713,20 @@ class SubscribeSync(_PluginBase):
                     add_fail.append(name)
                     logger.error(f"[SubscribeSync] ✗ 推送 SA 失败：{name}（HTTP {r.status_code}）：{resp_body}")
                     continue
-                # 再判断 SA 返回的 body（SA 可能 200 但 body 里 success=false）
+                # 根据 SA 响应体判定保存是否成功：success=true 且 message="保存成功"
                 try:
                     resp_json = json.loads(resp_body) if resp_body else {}
                 except Exception:
                     resp_json = {}
                 sa_success = resp_json.get("success")
-                sa_code = resp_json.get("code")
-                sa_msg = resp_json.get("msg") or resp_json.get("message") or resp_json.get("detail") or ""
+                sa_msg = resp_json.get("message") or resp_json.get("msg") or resp_json.get("detail") or ""
                 resp_data = resp_json.get("data")
-                if sa_success is False or (isinstance(sa_code, int) and sa_code not in (0, 200, 201)):
+                sa_ok = (sa_success is True or sa_success == "true") and (sa_msg == "保存成功")
+                if not sa_ok:
                     add_fail.append(name)
                     logger.error(
-                        f"[SubscribeSync] ✗ 推送 SA 被 SA 拒绝：{name}，"
-                        f"success={sa_success} code={sa_code} msg={sa_msg} body={resp_body[:500]}"
+                        f"[SubscribeSync] ✗ 推送 SA 未成功：{name}，"
+                        f"success={sa_success} message={sa_msg} body={resp_body[:500]}"
                     )
                     continue
                 # 成功：SA 返回的新任务里应带有 id
