@@ -25,7 +25,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.plugins import _PluginBase
 from app.log import logger
-from app.schemas import Notification, NotificationType
+from app.schemas.types import NotificationType
 from app.schemas.types import EventType
 from app.db.subscribe_oper import SubscribeOper
 from app.core.event import eventmanager, Event
@@ -108,7 +108,7 @@ def is_cloudflare_challenge(text: str) -> bool:
 class SubscribeSync(_PluginBase):
     # 插件元数据
     plugin_name = "订阅同步"
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     plugin_author = "AutoBuilder"
     author_url = "https://github.com"
     plugin_description = (
@@ -1792,19 +1792,24 @@ class SubscribeSync(_PluginBase):
         logger.info("[SubscribeSync] ✓ 任务序列执行完毕")
         self._seq_summary(results)
 
-    # -------- 消息通知（优先 MP 内置通道，独立 TG Bot 作降级） --------
+    # -------- 消息通知（MP 内置通道 + 独立 TG Bot 降级） --------
     def _notify(self, title: str, text: str, image: str = ""):
-        """发送通知：优先通过 MP 配置的通道，回退到独立 Telegram Bot。"""
-        # 1) 优先使用 MP 内置消息通道（用 Subscribe 类型，确保通知路由生效）
+        """发送通知：通过 MP 配置的消息通道发送，失败时降级到独立 TG Bot。"""
+        # 1) MP 内置消息通道（参考 p115strgmsub 等可用插件写法）
         try:
-            notif = Notification(
-                mtype=NotificationType.Subscribe,
-                title=title,
-                text=text,
-            )
             if image and (image.startswith("http://") or image.startswith("https://")):
-                notif.image = image
-            self.chain.post_message(notif)
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title=title,
+                    text=text,
+                    image=image,
+                )
+            else:
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title=title,
+                    text=text,
+                )
             logger.info(f"[SubscribeSync] MP 内置通知已发送: {title}")
             return
         except Exception as e:
