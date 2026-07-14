@@ -1789,18 +1789,18 @@ class SubscribeSync(_PluginBase):
         """发送通知：优先通过 MP 配置的通道，回退到独立 Telegram Bot。"""
         # 1) 优先使用 MP 内置消息通道
         try:
-            self.post_message(
-                mtype=NotificationType.Plugin,
-                title=title,
-                text=text,
-                image=image,
-            )
+            kwargs = {"mtype": NotificationType.Plugin, "title": title, "text": text}
+            if image and (image.startswith("http://") or image.startswith("https://")):
+                kwargs["image"] = image
+            self.post_message(**kwargs)
+            logger.info(f"[SubscribeSync] MP 内置通知已发送: {title}")
             return
         except Exception as e:
-            logger.debug(f"[SubscribeSync] MP 内置通知发送失败：{e}")
+            logger.warning(f"[SubscribeSync] MP 内置通知发送失败: {e}")
 
         # 2) 降级到独立 Telegram Bot（如果配置了的话）
         if not self._tg_token or not self._tg_chat:
+            logger.warning("[SubscribeSync] 无可用通知通道（MP 通知失败且未配置独立 TG Bot）")
             return
         try:
             if image and (image.startswith("http://") or image.startswith("https://")):
@@ -1825,6 +1825,7 @@ class SubscribeSync(_PluginBase):
                     },
                     timeout=15,
                 )
+            logger.info(f"[SubscribeSync] TG Bot 通知已发送: {title}")
         except Exception as e:
             logger.warning(f"[SubscribeSync] TG Bot 通知发送失败：{e}")
 
