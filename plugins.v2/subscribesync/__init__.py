@@ -27,6 +27,7 @@ from app.plugins import _PluginBase
 from app.log import logger
 from app.schemas import Notification, NotificationType
 from app.schemas.types import EventType
+from app.db.subscribe_oper import SubscribeOper
 
 
 # ===== 常量 =====
@@ -123,8 +124,8 @@ class SubscribeSync(_PluginBase):
     def default_config() -> Dict[str, Any]:
         return {
             "enabled": False,
-            # 源 MP 配置（本实例或远程）
-            "mp_base_url": "http://localhost:3000",
+            # 源 MP 配置（留空则读取本地数据库）
+            "mp_base_url": "",
             "mp_api_token": "",
             "mp_timeout": 15,
             # 目标 SA 配置
@@ -264,9 +265,9 @@ class SubscribeSync(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "mp_base_url",
-                                            "label": "MP 地址",
-                                            "placeholder": "http://localhost:3000",
-                                            "hint": "源 MoviePilot 实例地址",
+                                            "label": "MP 地址（可选）",
+                                            "placeholder": "远程 MP 地址，留空则读取本地数据库",
+                                            "hint": "仅同步其他 MP 实例时才需填写",
                                             "persistent-hint": True,
                                         },
                                     },
@@ -280,8 +281,8 @@ class SubscribeSync(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "mp_api_token",
-                                            "label": "API Token",
-                                            "placeholder": "从 MP 后台「设置」中获取",
+                                            "label": "API Token（可选）",
+                                            "placeholder": "远程 MP 的 API Token",
                                             "type": "password",
                                         },
                                     },
@@ -558,7 +559,7 @@ class SubscribeSync(_PluginBase):
             },
         ], {
             "enabled": False,
-            "mp_base_url": "http://localhost:3000",
+            "mp_base_url": "",
             "mp_api_token": "",
             "mp_timeout": 15,
             "sa_base_url": "https://sa.lxb.icu",
@@ -1022,22 +1023,25 @@ class SubscribeSync(_PluginBase):
 
     # -------- 同步 MP 订阅 --------
     def _sync_mp(self) -> dict:
-        """拉取源 MP 的订阅列表。"""
-        if not self._mp_token:
-            logger.error("[SubscribeSync] 未配置 MP API Token")
-            return {"error": "未配置 MP API Token", "total": 0, "users": [], "items": []}
-
+        """拉取 MP 的订阅列表（优先从本地数据库读取，无 Token 时直读本地）。"""
         logger.info("[SubscribeSync] 正在拉取 MP 订阅列表...")
+
+        # 优先尝试从本地 MP 数据库直接读取
+        if not self._mp_token or not self._mp_base:
+            logger.info("[SubscribeSync] 未配置远程 MP Token，从本地数据库读取订阅")
+            return self._sync_mp_local()
+
+        # 回退到远程 API 方式
         url = f"{self._mp_base}/api/v1/subscribe/list?token={self._mp_token}"
         try:
             r = self._http_get(url, timeout=self._mp_timeout)
         except Exception as e:
-            logger.error(f"[SubscribeSync] 拉取 MP 订阅失败：{e}")
-            return {"error": str(e), "total": 0, "users": [], "items": []}
+            logger.warning(f"[SubscribeSync] 远程 API 不可达，尝试本地数据库：{e}")
+            return self._sync_mp_local()
 
         if r.status_code == 401:
-            logger.error("[SubscribeSync] MP API Token 校验失败（401）")
-            return {"error": "API Token 校验失败", "total": 0, "users": [], "items": []}
+            logger.warning("[SubscribeSync] MP API Token 校验失败（401），尝试本地数据库")
+            return self._sync_mp_local()
         if r.status_code != 200:
             logger.error(f"[SubscribeSync] MP 接口返回 {r.status_code}")
             return {"error": f"MP 返回 HTTP {r.status_code}", "total": 0, "users": [], "items": []}
@@ -1055,35 +1059,96 @@ class SubscribeSync(_PluginBase):
 
         items = []
         for sub in data:
-            state = sub.get("state") or "N"
-            state_label, state_type = STATE_MAP.get(state, (state or "未知", "secondary"))
-            mtype = sub.get("type") or ""
-            type_label = TYPE_MAP.get(mtype, mtype or "未知")
-            total_ep = int(sub.get("total_episode") or 0)
-            lack_ep = int(sub.get("lack_episode") or 0)
-            got_ep = (total_ep - lack_ep) if total_ep else 0
-            items.append({
-                "id": sub.get("id"),
-                "name": sub.get("name") or "未知",
-                "year": sub.get("year") or "",
-                "type": type_label,
-                "raw_type": mtype,
-                "season": sub.get("season") or "",
-                "state": state,
-                "state_label": state_label,
-                "state_type": state_type,
-                "username": sub.get("username") or "默认",
-                "poster": normalize_poster(sub.get("poster")),
-                "backdrop": normalize_poster(sub.get("backdrop")),
-                "total_episode": total_ep,
-                "lack_episode": lack_ep,
-                "got_episode": got_ep,
-                "date": sub.get("date") or "",
-                "description": sub.get("description") or "",
-                "vote": sub.get("vote") or 0,
-                "tmdbid": str(sub.get("tmdbid") or ""),
-            })
+            items.append(self._build_mp_item_from_dict(sub))
 
+        logger.info(f"[SubscribeSync] ✓ MP 订阅远程拉取完成：{len(items)} 条")
+        return self._cache_mp_result(items)
+
+    def _sync_mp_local(self) -> dict:
+        """直接从本地 MP 数据库读取订阅列表。"""
+        try:
+            subs = SubscribeOper().list()
+        except Exception as e:
+            logger.error(f"[SubscribeSync] 本地数据库读取失败：{e}")
+            return {"error": str(e), "total": 0, "users": [], "items": []}
+
+        items = []
+        for sub in subs:
+            items.append(self._build_mp_item_from_model(sub))
+
+        logger.info(f"[SubscribeSync] ✓ 本地 MP 订阅读取完成：{len(items)} 条")
+        return self._cache_mp_result(items)
+
+    def _build_mp_item_from_model(self, sub) -> dict:
+        """将 Subscribe ORM 模型转为统一字典。"""
+        state = sub.state or "N"
+        state_label, state_type = STATE_MAP.get(state, (state or "未知", "secondary"))
+        mtype = sub.type or ""
+        type_label = TYPE_MAP.get(mtype, mtype or "未知")
+        total_ep = int(sub.total_episode or 0)
+        lack_ep = int(sub.lack_episode or 0)
+        got_ep = (total_ep - lack_ep) if total_ep else 0
+        return {
+            "id": sub.id,
+            "name": sub.name or "未知",
+            "year": sub.year or "",
+            "type": type_label,
+            "raw_type": mtype,
+            "season": sub.season or "",
+            "state": state,
+            "state_label": state_label,
+            "state_type": state_type,
+            "username": sub.username or "默认",
+            "poster": normalize_poster(sub.poster or ""),
+            "backdrop": normalize_poster(sub.backdrop or ""),
+            "total_episode": total_ep,
+            "lack_episode": lack_ep,
+            "got_episode": got_ep,
+            "date": sub.date or "",
+            "description": sub.description or "",
+            "tmdbid": str(sub.tmdbid or ""),
+            "doubanid": str(sub.doubanid or ""),
+            "imdbid": sub.imdbid or "",
+            "tvdbid": sub.tvdbid or "",
+            "note": sub.note or "",
+        }
+
+    def _build_mp_item_from_dict(self, sub: dict) -> dict:
+        """将远程 API 返回的字典转为统一字典。"""
+        state = sub.get("state") or "N"
+        state_label, state_type = STATE_MAP.get(state, (state or "未知", "secondary"))
+        mtype = sub.get("type") or ""
+        type_label = TYPE_MAP.get(mtype, mtype or "未知")
+        total_ep = int(sub.get("total_episode") or 0)
+        lack_ep = int(sub.get("lack_episode") or 0)
+        got_ep = (total_ep - lack_ep) if total_ep else 0
+        return {
+            "id": sub.get("id"),
+            "name": sub.get("name") or "未知",
+            "year": sub.get("year") or "",
+            "type": type_label,
+            "raw_type": mtype,
+            "season": sub.get("season") or "",
+            "state": state,
+            "state_label": state_label,
+            "state_type": state_type,
+            "username": sub.get("username") or "默认",
+            "poster": normalize_poster(sub.get("poster")),
+            "backdrop": normalize_poster(sub.get("backdrop")),
+            "total_episode": total_ep,
+            "lack_episode": lack_ep,
+            "got_episode": got_ep,
+            "date": sub.get("date") or "",
+            "description": sub.get("description") or "",
+            "tmdbid": str(sub.get("tmdbid") or ""),
+            "doubanid": str(sub.get("doubanid") or ""),
+            "imdbid": sub.get("imdbid") or "",
+            "tvdbid": sub.get("tvdbid") or "",
+            "note": sub.get("note") or "",
+        }
+
+    def _cache_mp_result(self, items: List[dict]) -> dict:
+        """缓存 MP 订阅数据并检测新订阅通知。"""
         # 分组
         groups: Dict[str, list] = {}
         for it in items:
@@ -1104,11 +1169,11 @@ class SubscribeSync(_PluginBase):
 
         self._cache["mp"] = {
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "data": {"items": items, "users": users, "source": self._mp_base},
+            "data": {"items": items, "users": users, "source": "本地数据库" if (not self._mp_token or not self._mp_base) else self._mp_base},
         }
         self._save_cache()
         logger.info(f"[SubscribeSync] MP 订阅已缓存（{len(items)} 条）")
-        return {"total": len(items), "source": self._mp_base, "users": users, "items": items}
+        return {"total": len(items), "source": self._mp_base or "本地数据库", "users": users, "items": items}
 
     # -------- 同步 SA 订阅 --------
     def _sync_sa(self) -> dict:
@@ -1292,30 +1357,16 @@ class SubscribeSync(_PluginBase):
         """同步：拉取 MP 订阅 → 查询 SA 季集数 / 电影填模板。"""
         logger.info("[SubscribeSync] 开始同步（电视剧+电影）...")
 
-        if not self._mp_token:
-            return {"error": "未配置 MP API Token", "success": 0, "total": 0, "items": []}
-
-        # 1) 拉取 MP 订阅
-        try:
-            r = self._http_get(f"{self._mp_base}/api/v1/subscribe/list?token={self._mp_token}", timeout=self._mp_timeout)
-        except Exception as e:
-            logger.error(f"[SubscribeSync] 拉取 MP 订阅失败：{e}")
-            return {"error": str(e), "success": 0, "total": 0, "items": []}
-        if r.status_code != 200:
-            logger.error(f"[SubscribeSync] MP 接口返回 {r.status_code}")
-            return {"error": f"MP 返回 HTTP {r.status_code}", "success": 0, "total": 0, "items": []}
-        try:
-            mp_data = r.json()
-        except Exception:
-            return {"error": "MP 返回非 JSON", "success": 0, "total": 0, "items": []}
-        mp_items = mp_data.get("data") if isinstance(mp_data, dict) else mp_data
-        if not isinstance(mp_items, list):
-            mp_items = []
+        # 1) 拉取 MP 订阅（本地数据库或远程 API）
+        mp_result = self._sync_mp()
+        if "error" in mp_result:
+            return {"error": mp_result["error"], "success": 0, "total": 0, "items": []}
+        mp_items = mp_result.get("items", [])
 
         # 分类
         tv_items, movie_items, other = [], [], 0
         for it in mp_items:
-            kind = classify_type(it.get("type"))
+            kind = classify_type(it.get("type") or it.get("raw_type"))
             if kind == "tv":
                 tv_items.append(it)
             elif kind == "movie":
@@ -1396,24 +1447,11 @@ class SubscribeSync(_PluginBase):
         """
         logger.info("[SubscribeSync] 开始 mp同步sa ...")
 
-        if not self._mp_token:
-            return {"error": "未配置 MP API Token", "success": True, "cancel": 0, "cancel_total": 0, "add": 0, "add_total": 0}
-
-        # 1) 拉取 MP 订阅
-        try:
-            r = self._http_get(f"{self._mp_base}/api/v1/subscribe/list?token={self._mp_token}", timeout=self._mp_timeout)
-        except Exception as e:
-            logger.error(f"[SubscribeSync] 拉取 MP 订阅失败：{e}")
-            return {"error": str(e), "success": False}
-        if r.status_code != 200:
-            return {"error": f"MP 返回 {r.status_code}", "success": False}
-        try:
-            mp_data = r.json()
-        except Exception:
-            return {"error": "MP 返回非 JSON", "success": False}
-        mp_items = mp_data.get("data") if isinstance(mp_data, dict) else mp_data
-        if not isinstance(mp_items, list):
-            mp_items = []
+        # 1) 拉取 MP 订阅（本地数据库或远程 API）
+        mp_result = self._sync_mp()
+        if "error" in mp_result:
+            return {"error": mp_result["error"], "success": False}
+        mp_items = mp_result.get("items", [])
         if not mp_items:
             logger.warning("[SubscribeSync] MP 无订阅，跳过")
             return {"success": True, "cancel": 0, "cancel_total": 0, "add": 0, "add_total": 0}
@@ -1580,7 +1618,12 @@ class SubscribeSync(_PluginBase):
         return [self._normalize_sa_item(it) for it in items if isinstance(it, dict)]
 
     def _mp_delete_subscribe(self, sub_id, tmdbid: str) -> int:
-        """调用 MoviePilot 删除订阅，返回状态码。"""
+        """删除 MP 订阅，优先本地数据库。"""
+        # 本地数据库删除
+        if not self._mp_token or not self._mp_base:
+            return self._mp_delete_local(sub_id, tmdbid)
+
+        # 远程 API 删除
         if sub_id:
             try:
                 r = self._http_delete(
@@ -1602,6 +1645,21 @@ class SubscribeSync(_PluginBase):
                 return r.status_code
             except Exception:
                 pass
+        return 404
+
+    def _mp_delete_local(self, sub_id, tmdbid: str) -> int:
+        """本地数据库删除订阅。"""
+        oper = SubscribeOper()
+        if sub_id:
+            oper.delete(sub_id)
+            logger.info(f"[SubscribeSync] 本地删除订阅 id={sub_id}")
+            return 200
+        if tmdbid:
+            subs = oper.list_by_tmdbid(int(tmdbid))
+            for s in subs:
+                oper.delete(s.id)
+            logger.info(f"[SubscribeSync] 本地删除 tmdbid={tmdbid} 的 {len(subs)} 条订阅")
+            return 200
         return 404
 
     # -------- 任务序列 --------
@@ -1868,35 +1926,11 @@ class SubscribeSync(_PluginBase):
         if not sub_id and not tmdbid:
             return {"success": False, "message": "缺少订阅标识"}
 
-        if not self._mp_token:
-            return {"success": False, "message": "未配置 MP API Token"}
-
-        # 按 id 删除
-        if sub_id:
-            try:
-                r = self._http_delete(
-                    f"{self._mp_base}/api/v1/subscribe/{sub_id}?token={self._mp_token}",
-                    headers={"Accept": "application/json"},
-                    timeout=self._mp_timeout,
-                )
-                if r.status_code in (200, 204):
-                    logger.info(f"[SubscribeSync] 已取消 MP 订阅：{name}（id={sub_id}）")
-                    return {"success": True, "message": f"已取消：{name}"}
-            except Exception as e:
-                logger.warning(f"[SubscribeSync] 按 id 取消失败：{e}")
-
-        # 按媒体 id 删除
-        if tmdbid:
-            try:
-                r = self._http_delete(
-                    f"{self._mp_base}/api/v1/subscribe/media/tmdb:{tmdbid}?token={self._mp_token}",
-                    headers={"Accept": "application/json"},
-                    timeout=self._mp_timeout,
-                )
-                if r.status_code in (200, 204):
-                    logger.info(f"[SubscribeSync] 已取消 MP 订阅：{name}（tmdbid={tmdbid}）")
-                    return {"success": True, "message": f"已取消：{name}"}
-            except Exception as e:
-                logger.error(f"[SubscribeSync] 按媒体 id 取消失败：{e}")
+        # 本地或远程删除
+        status = self._mp_delete_subscribe(sub_id, tmdbid)
+        if status in (200, 204):
+            by = f"id={sub_id}" if sub_id else f"tmdbid={tmdbid}"
+            logger.info(f"[SubscribeSync] 已取消 MP 订阅：{name}（{by}）")
+            return {"success": True, "message": f"已取消：{name}"}
 
         return {"success": False, "message": f"取消失败"}
