@@ -108,7 +108,7 @@ def is_cloudflare_challenge(text: str) -> bool:
 class SubscribeSync(_PluginBase):
     # 插件元数据
     plugin_name = "订阅同步"
-    plugin_version = "1.5.2"
+    plugin_version = "1.5.3"
     plugin_author = "AutoBuilder"
     author_url = "https://github.com"
     plugin_description = (
@@ -1625,19 +1625,11 @@ class SubscribeSync(_PluginBase):
                 cancel_fail.append(name)
                 logger.error(f"[SubscribeSync] ✗ 取消失败：{name}（{sc}）")
 
-        # 5) 推送 SA
+        # 5) 推送 SA（含 401/403 自动重登录）
         add_ok, add_fail, add_skip = [], [], []
         if to_add:
-            save_headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/plain, */*",
-                "Sec-Fetch-Site": "same-origin",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Dest": "empty",
-            }
-            if cookie:
-                save_headers["Cookie"] = cookie
+            _push_token = token
+            _push_cookie = cookie
 
             for i, it in enumerate(to_add, 1):
                 name = it.get("name") or it.get("title") or "未知"
@@ -1654,9 +1646,20 @@ class SubscribeSync(_PluginBase):
                     if not tvdbid:
                         tvdbid = str(it.get("tmdbid") or it.get("tmdb_id") or "")
                     if tvdbid:
-                        sa_data = self._query_sa_season_count(token, cookie, name, tvdbid)
+                        sa_data = self._query_sa_season_count(_push_token, _push_cookie, name, tvdbid)
 
                 filled = self._build_filled_template(it, kind, sa_data)
+
+                save_headers = {
+                    "Authorization": f"Bearer {_push_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/plain, */*",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Sec-Fetch-Mode": "cors",
+                    "Sec-Fetch-Dest": "empty",
+                }
+                if _push_cookie:
+                    save_headers["Cookie"] = _push_cookie
 
                 try:
                     r = self._http_post(
@@ -1667,15 +1670,46 @@ class SubscribeSync(_PluginBase):
                     )
                 except Exception as e:
                     add_fail.append(name)
-                    logger.error(f"[SubscribeSync] 推送「{name}」异常：{e}")
+                    logger.error(f"[SubscribeSync] 推送「{name}」网络异常：{e}")
                     continue
+
+                # 401/403 → 重新登录刷新 token，重试一次
+                if r.status_code in (401, 403):
+                    logger.warning(f"[SubscribeSync] 推送「{name}」返回 {r.status_code}，尝试重新登录...")
+                    res = self._do_sa_login(
+                        self._sa_session.get("username", "") or self._sa_user,
+                        self._sa_session.get("password", "") or self._sa_pass,
+                        self._sa_session.get("cookie", ""),
+                    )
+                    if res["ok"]:
+                        _push_token = res["token"]
+                        _push_cookie = res["cookie"]
+                        self._sa_session.update({"token": res["token"], "cookie": res["cookie"], "token_exp": res["exp"]})
+                        self._save_sa_session(self._sa_session)
+                        save_headers["Authorization"] = f"Bearer {_push_token}"
+                        if _push_cookie:
+                            save_headers["Cookie"] = _push_cookie
+                        try:
+                            r = self._http_post(
+                                f"{self._sa_base}/api/v1/telegram_subscribe/save_telegram_subscribe_task",
+                                headers=save_headers,
+                                json_data=filled,
+                                timeout=self._sa_timeout,
+                            )
+                        except Exception as e:
+                            add_fail.append(name)
+                            logger.error(f"[SubscribeSync] 推送「{name}」重试异常：{e}")
+                            continue
+                    else:
+                        logger.error(f"[SubscribeSync] 重登录失败：{res['error']}")
 
                 if r.status_code in (200, 201):
                     add_ok.append(name)
                     logger.info(f"[SubscribeSync] ✓ 已推送 SA：{name}")
                 else:
                     add_fail.append(name)
-                    logger.error(f"[SubscribeSync] ✗ 推送 SA 失败：{name} ({r.status_code})")
+                    resp_text = (r.text or "")[:500]
+                    logger.error(f"[SubscribeSync] ✗ 推送 SA 失败：{name}（HTTP {r.status_code}）：{resp_text}")
 
         # 汇总日志
         lines = ["=" * 50, "mp同步sa 汇总", "=" * 50]
@@ -1711,7 +1745,7 @@ class SubscribeSync(_PluginBase):
         }
 
     def _fetch_sa_tasks(self, token: str, cookie: str) -> Optional[List[dict]]:
-        """拉取 SA telegram 订阅任务列表（简化版）。"""
+        """拉取 SA telegram 订阅任务列表（含 401/403 自动重登录）。"""
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json, text/plain, */*",
@@ -1726,11 +1760,42 @@ class SubscribeSync(_PluginBase):
         except Exception as e:
             logger.error(f"[SubscribeSync] 拉取 SA 任务失败：{e}")
             return None
+
+        # 401/403 自动重新登录重试
+        if r.status_code in (401, 403):
+            if is_cloudflare_challenge(r.text):
+                logger.error("[SubscribeSync] SA 被 Cloudflare 拦截")
+                return None
+            logger.warning(f"[SubscribeSync] SA 拉取任务返回 {r.status_code}，尝试重新登录重试...")
+            res = self._do_sa_login(
+                self._sa_session.get("username", "") or self._sa_user,
+                self._sa_session.get("password", "") or self._sa_pass,
+                self._sa_session.get("cookie", ""),
+            )
+            if not res["ok"]:
+                logger.error(f"[SubscribeSync] SA 重登录失败：{res['error']}")
+                return None
+            self._sa_session.update({"token": res["token"], "cookie": res["cookie"], "token_exp": res["exp"]})
+            self._save_sa_session(self._sa_session)
+            headers["Authorization"] = f"Bearer {res['token']}"
+            if res["cookie"]:
+                headers["Cookie"] = res["cookie"]
+            try:
+                r = self._http_get(f"{self._sa_base}/api/v1/telegram_subscribe/tasks", headers=headers, timeout=self._sa_timeout)
+            except Exception as e:
+                logger.error(f"[SubscribeSync] SA 重试失败：{e}")
+                return None
+            if r.status_code in (401, 403):
+                logger.error(f"[SubscribeSync] SA 重试后仍被拒绝（{r.status_code}）")
+                return None
+
         if r.status_code != 200:
+            logger.error(f"[SubscribeSync] SA 返回 {r.status_code}：{(r.text or '')[:300]}")
             return None
         try:
             data = r.json()
         except Exception:
+            logger.error("[SubscribeSync] SA 返回非 JSON")
             return None
         items = data.get("data") if isinstance(data, dict) else data
         if isinstance(items, dict):
