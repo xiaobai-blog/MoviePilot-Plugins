@@ -28,6 +28,7 @@ from app.log import logger
 from app.schemas import Notification, NotificationType
 from app.schemas.types import EventType
 from app.db.subscribe_oper import SubscribeOper
+from app.core.event import eventmanager, Event
 
 
 # ===== 常量 =====
@@ -107,7 +108,7 @@ def is_cloudflare_challenge(text: str) -> bool:
 class SubscribeSync(_PluginBase):
     # 插件元数据
     plugin_name = "订阅同步"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "AutoBuilder"
     author_url = "https://github.com"
     plugin_description = (
@@ -211,6 +212,46 @@ class SubscribeSync(_PluginBase):
                 self._reset_switch(key)
 
         threading.Thread(target=_run, daemon=True).start()
+
+    @eventmanager.register(EventType.SubscribeAdded)
+    def _on_subscribe_added(self, event: Event):
+        """监听 MP 新增订阅事件，自动触发同步。"""
+        if not self._enabled:
+            return
+        try:
+            sub_data = event.event_data or {}
+            sub_name = sub_data.get("name", "") or (sub_data.get("mediainfo", {}) if isinstance(sub_data.get("mediainfo"), dict) else {}).get("title", "未知")
+            logger.info(f"[SubscribeSync] 检测到新增订阅「{sub_name}」，5 秒后自动刷新")
+        except Exception:
+            logger.info("[SubscribeSync] 检测到新增订阅，5 秒后自动刷新")
+
+        # 延迟 5 秒执行，避免频繁触发
+        self._debounce_sync()
+
+    # 防抖：避免短时间内多次触发
+    _debounce_timer = None
+
+    def _debounce_sync(self):
+        """防抖触发同步 MP + 开始同步。"""
+        if self._debounce_timer:
+            self._debounce_timer.cancel()
+
+        def _do():
+            try:
+                self._sync_mp()
+            except Exception as e:
+                logger.error(f"[SubscribeSync] 自动刷新 MP 订阅失败：{e}")
+
+            # 如果启用定时任务且 mp同步sa 启用，则自动执行
+            if self._task_enabled and self._enabled_tasks.get("mp_sync_sa", True):
+                try:
+                    self._mp_sync_sa()
+                except Exception as e:
+                    logger.error(f"[SubscribeSync] 自动 mp同步sa 失败：{e}")
+
+        self._debounce_timer = threading.Timer(5, _do)
+        self._debounce_timer.daemon = True
+        self._debounce_timer.start()
 
     def _reset_switch(self, key: str):
         """仅重置单个开关字段，不覆盖其他配置。"""
@@ -600,8 +641,44 @@ class SubscribeSync(_PluginBase):
 
     # ==================== 详情页 ====================
 
+    def _get_page_cache(self, key: str) -> dict:
+        """读取缓存数据。"""
+        try:
+            data = self.get_data(f"cache_{key}")
+            return json.loads(data) if data else {}
+        except Exception:
+            return {}
+
     def get_page(self) -> List[dict]:
         """返回详情页面（展示缓存数据）。"""
+        mp_cache = self._get_page_cache("mp") or {}
+        sa_cache = self._get_page_cache("sa") or {}
+        sync_cache = self._get_page_cache("sync") or {}
+
+        mp_data = mp_cache.get("data", {})
+        mp_updated = mp_cache.get("updated_at", "从未")
+        mp_items = mp_data.get("items", [])
+        mp_count = len(mp_items)
+
+        sa_data = sa_cache.get("data", {})
+        sa_updated = sa_cache.get("updated_at", "从未")
+        sa_items = sa_data.get("items", [])
+        sa_count = len(sa_items)
+
+        sync_updated = sync_cache.get("updated_at", "从未")
+        sync_data = sync_cache.get("data", {})
+        sync_ok = sync_data.get("success", 0) if isinstance(sync_data, dict) else 0
+        sync_total = sync_data.get("total", 0) if isinstance(sync_data, dict) else 0
+
+        # 构建 MP 订阅表格数据
+        mp_table_items = []
+        for it in mp_items[:50]:  # 最多展示 50 条
+            mp_table_items.append({
+                "名称": it.get("name", "?"),
+                "类型": it.get("type", "?"),
+                "用户": it.get("username", "?"),
+            })
+
         return [
             {
                 "component": "VContainer",
@@ -633,21 +710,24 @@ class SubscribeSync(_PluginBase):
                                                                     {
                                                                         "component": "span",
                                                                         "props": {"class": "text-h6"},
-                                                                        "content": [
-                                                                            {"component": "text", "props": {}, "text": "MP 订阅缓存：{{ SubscribeSync_mp_updated }}"},
-                                                                        ],
+                                                                        "content": [{"component": "text", "props": {}, "text": f"MP 订阅缓存：{mp_updated}"}],
                                                                     },
                                                                     {"component": "VDivider", "props": {}},
                                                                     {
+                                                                        "component": "span",
+                                                                        "props": {"class": "text-body-1"},
+                                                                        "content": [{"component": "text", "props": {}, "text": f"共 {mp_count} 条，{len(mp_data.get('users', []))} 位用户"}],
+                                                                    },
+                                                                    {
                                                                         "component": "VTable",
-                                                                        "props": {"items": "SubscribeSync_mp_items", "hover": True, "density": "compact"},
+                                                                        "props": {"items": mp_table_items, "hover": True, "density": "compact"},
                                                                         "content": [
                                                                             {
                                                                                 "component": "colgroup",
                                                                                 "content": [
                                                                                     {"component": "col", "props": {"style": "width:50%"}},
-                                                                                    {"component": "col", "props": {"style": "width:30%"}},
-                                                                                    {"component": "col", "props": {"style": "width:20%"}},
+                                                                                    {"component": "col", "props": {"style": "width:25%"}},
+                                                                                    {"component": "col", "props": {"style": "width:25%"}},
                                                                                 ],
                                                                             },
                                                                         ],
@@ -661,15 +741,13 @@ class SubscribeSync(_PluginBase):
                                                                     {
                                                                         "component": "span",
                                                                         "props": {"class": "text-h6"},
-                                                                        "content": [
-                                                                            {"component": "text", "props": {}, "text": "SA 订阅缓存：{{ SubscribeSync_sa_updated }}"},
-                                                                        ],
+                                                                        "content": [{"component": "text", "props": {}, "text": f"SA 订阅缓存：{sa_updated}"}],
                                                                     },
                                                                     {"component": "VDivider", "props": {}},
                                                                     {
                                                                         "component": "span",
                                                                         "props": {"class": "text-body-1"},
-                                                                        "content": [{"component": "text", "props": {}, "text": "共 {{ SubscribeSync_sa_count }} 条"}],
+                                                                        "content": [{"component": "text", "props": {}, "text": f"共 {sa_count} 条"}],
                                                                     },
                                                                 ],
                                                             },
@@ -680,15 +758,13 @@ class SubscribeSync(_PluginBase):
                                                                     {
                                                                         "component": "span",
                                                                         "props": {"class": "text-h6"},
-                                                                        "content": [
-                                                                            {"component": "text", "props": {}, "text": "同步缓存：{{ SubscribeSync_sync_updated }}"},
-                                                                        ],
+                                                                        "content": [{"component": "text", "props": {}, "text": f"同步缓存：{sync_updated}"}],
                                                                     },
                                                                     {"component": "VDivider", "props": {}},
                                                                     {
                                                                         "component": "span",
                                                                         "props": {"class": "text-body-1"},
-                                                                        "content": [{"component": "text", "props": {}, "text": "{{ SubscribeSync_sync_summary }}"}],
+                                                                        "content": [{"component": "text", "props": {}, "text": f"上次同步：成功 {sync_ok} / 共 {sync_total}"}],
                                                                     },
                                                                 ],
                                                             },
