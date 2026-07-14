@@ -108,7 +108,7 @@ def is_cloudflare_challenge(text: str) -> bool:
 class SubscribeSync(_PluginBase):
     # 插件元数据
     plugin_name = "订阅同步"
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     plugin_author = "AutoBuilder"
     author_url = "https://github.com"
     plugin_description = (
@@ -232,7 +232,7 @@ class SubscribeSync(_PluginBase):
     _debounce_timer = None
 
     def _debounce_sync(self):
-        """防抖触发同步 MP + 开始同步。"""
+        """防抖触发完整 4 步序列：同步 MP → 同步 SA → 开始同步 → mp同步sa。"""
         if self._debounce_timer:
             self._debounce_timer.cancel()
 
@@ -242,12 +242,20 @@ class SubscribeSync(_PluginBase):
             except Exception as e:
                 logger.error(f"[SubscribeSync] 自动刷新 MP 订阅失败：{e}")
 
-            # 如果启用定时任务且 mp同步sa 启用，则自动执行
-            if self._task_enabled and self._enabled_tasks.get("mp_sync_sa", True):
-                try:
-                    self._mp_sync_sa()
-                except Exception as e:
-                    logger.error(f"[SubscribeSync] 自动 mp同步sa 失败：{e}")
+            try:
+                self._sync_sa()
+            except Exception as e:
+                logger.error(f"[SubscribeSync] 自动刷新 SA 订阅失败：{e}")
+
+            try:
+                self._sync()
+            except Exception as e:
+                logger.error(f"[SubscribeSync] 自动同步失败：{e}")
+
+            try:
+                self._mp_sync_sa()
+            except Exception as e:
+                logger.error(f"[SubscribeSync] 自动 mp同步sa 失败：{e}")
 
         self._debounce_timer = threading.Timer(5, _do)
         self._debounce_timer.daemon = True
@@ -1787,18 +1795,20 @@ class SubscribeSync(_PluginBase):
     # -------- 消息通知（优先 MP 内置通道，独立 TG Bot 作降级） --------
     def _notify(self, title: str, text: str, image: str = ""):
         """发送通知：优先通过 MP 配置的通道，回退到独立 Telegram Bot。"""
-        # 1) 优先使用 MP 内置消息通道
+        # 1) 优先使用 MP 内置消息通道（用 Subscribe 类型，确保通知路由生效）
         try:
-            kwargs = {"mtype": NotificationType.Plugin, "title": title, "text": text}
+            notif = Notification(
+                mtype=NotificationType.Subscribe,
+                title=title,
+                text=text,
+            )
             if image and (image.startswith("http://") or image.startswith("https://")):
-                kwargs["image"] = image
-            self.post_message(**kwargs)
+                notif.image = image
+            self.chain.post_message(notif)
             logger.info(f"[SubscribeSync] MP 内置通知已发送: {title}")
             return
         except Exception as e:
             logger.warning(f"[SubscribeSync] MP 内置通知发送失败: {e}")
-
-        # 2) 降级到独立 Telegram Bot（如果配置了的话）
         if not self._tg_token or not self._tg_chat:
             logger.warning("[SubscribeSync] 无可用通知通道（MP 通知失败且未配置独立 TG Bot）")
             return
