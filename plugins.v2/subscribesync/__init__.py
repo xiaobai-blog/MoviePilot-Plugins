@@ -108,7 +108,7 @@ def is_cloudflare_challenge(text: str) -> bool:
 class SubscribeSync(_PluginBase):
     # 插件元数据
     plugin_name = "订阅同步"
-    plugin_version = "1.5.4"
+    plugin_version = "1.5.5"
     plugin_author = "AutoBuilder"
     author_url = "https://github.com"
     plugin_description = (
@@ -1659,14 +1659,8 @@ class SubscribeSync(_PluginBase):
                         logger.info(f"[SubscribeSync] 「{name}」SA 季集数查询结果：{str(sa_data)[:200]}")
 
                 filled = self._build_filled_template(it, kind, sa_data)
-                # 打印关键模板字段
-                logger.info(
-                    f"[SubscribeSync] 推送模板: title={filled.get('title')} "
-                    f"type={filled.get('type')} tmdbid={filled.get('tmdbid')} "
-                    f"year={filled.get('year')} season={filled.get('season')} "
-                    f"parent_id={filled.get('parent_id')} rule_id={filled.get('rule_id')} "
-                    f"id={repr(filled.get('id'))}"
-                )
+                # 打印完整模板 JSON
+                logger.info(f"[SubscribeSync] 推送「{name}」完整模板：{json.dumps(filled, ensure_ascii=False)}")
 
                 save_headers = {
                     "Authorization": f"Bearer {_push_token}",
@@ -1712,7 +1706,7 @@ class SubscribeSync(_PluginBase):
                     else:
                         logger.error(f"[SubscribeSync] 重登录失败：{res['error']}")
 
-                resp_body = (r.text or "")[:800]
+                resp_body = r.text or ""
                 if r.status_code in (200, 201):
                     add_ok.append(name)
                     logger.info(f"[SubscribeSync] ✓ 已推送 SA：{name}，SA 响应：{resp_body}")
