@@ -3,7 +3,7 @@
     "name": "订阅同步",
     "description": "拉取 MP 订阅与 SA telegram 订阅，按 tmdbid 对齐同步。支持电视剧查季集数、电影填模板推送、定时执行与 Telegram 命令控制。",
     "labels": "订阅,同步,SA,Telegram",
-    "version": "1.5.6",
+    "version": "1.5.7",
     "icon": "SubscribeSync.png",
     "author": "AutoBuilder",
     "level": 1,
@@ -21,7 +21,8 @@
       "v1.5.3": "修复 SA 推送：fetch 添加 401 重试 + 推送失败打印 SA 响应体 + 推送内 401 自动换 token",
       "v1.5.4": "mp同步sa：推送打印完整 SA 响应体 + 推送前后数量验证 + MP/SA tmdbid 对比日志",
       "v1.5.5": "推送完整模板 JSON 直接输出到日志；SA 响应去掉截断打印完整内容",
-      "v1.5.6": "对比 Docker 修复模板 end_words 双重转义；SA 推送响应体校验 success/code，不再只看 HTTP 状态"
+      "v1.5.6": "对比 Docker 修复模板 end_words 双重转义；SA 推送响应体校验 success/code，不再只看 HTTP 状态",
+      "v1.5.7": "mp同步sa：推送成功后自动取消对应 MP 订阅（交给 SA 接管），汇总合并取消统计"
     }
   }
 }

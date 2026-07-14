@@ -108,7 +108,7 @@ def is_cloudflare_challenge(text: str) -> bool:
 class SubscribeSync(_PluginBase):
     # 插件元数据
     plugin_name = "订阅同步"
-    plugin_version = "1.5.6"
+    plugin_version = "1.5.7"
     plugin_author = "AutoBuilder"
     author_url = "https://github.com"
     plugin_description = (
@@ -1629,6 +1629,7 @@ class SubscribeSync(_PluginBase):
 
         # 5) 推送 SA（含 401/403 自动重登录 + 详细日志）
         add_ok, add_fail, add_skip = [], [], []
+        add_ok_items = []  # (name, sub_id, tmdbid) 推送成功后用于取消 MP 订阅
         sa_before_count = len(sa_items)  # 推送前的 SA 任务数
         if to_add:
             _push_token = token
@@ -1731,10 +1732,25 @@ class SubscribeSync(_PluginBase):
                 # 成功：SA 返回的新任务里应带有 id
                 new_id = (resp_data or {}).get("id") if isinstance(resp_data, dict) else None
                 add_ok.append(name)
+                add_ok_items.append((name, it.get("id"), tmdbid_val))
                 logger.info(
                     f"[SubscribeSync] ✓ 已推送 SA：{name}，SA 新任务 id={new_id or '未知'}，"
                     f"完整响应：{resp_body}"
                 )
+
+        # 6) 推送成功后取消对应的 MP 订阅（交给 SA 接管，避免重复下载）
+        add_cancel_ok, add_cancel_fail = [], []
+        if add_ok_items:
+            logger.info(f"[SubscribeSync] 推送成功的 {len(add_ok_items)} 条将取消 MP 订阅（交给 SA 接管）...")
+            for name, sub_id, tmdbid in add_ok_items:
+                logger.info(f"[SubscribeSync] 取消 MP 订阅：{name}（已推送至 SA，tmdbid={tmdbid}）")
+                sc = self._mp_delete_subscribe(sub_id, tmdbid)
+                if sc in (200, 204):
+                    add_cancel_ok.append(name)
+                    logger.info(f"[SubscribeSync] ✓ 已取消 MP 订阅：{name}")
+                else:
+                    add_cancel_fail.append(name)
+                    logger.error(f"[SubscribeSync] ✗ 取消 MP 订阅失败：{name}（{sc}）")
 
         # 推送后验证：重新拉取 SA 任务，检查数量变化
         logger.info(f"[SubscribeSync] 推送前 SA 任务数 = {sa_before_count}，推送成功 = {len(add_ok)}，重新拉取验证...")
@@ -1748,13 +1764,17 @@ class SubscribeSync(_PluginBase):
             logger.error("[SubscribeSync] 验证失败：无法重新拉取 SA 任务")
 
         # 汇总日志
+        total_cancel_ok = cancel_ok + add_cancel_ok
+        total_cancel_fail = cancel_fail + add_cancel_fail
         lines = ["=" * 50, "mp同步sa 汇总", "=" * 50]
-        if to_cancel:
-            lines.append(f"取消 MP 订阅：{len(cancel_ok)}/{len(to_cancel)}")
-            if cancel_ok:
-                lines.append("  成功：" + "、".join(cancel_ok))
-            if cancel_fail:
-                lines.append("  失败：" + "、".join(cancel_fail))
+        if to_cancel or add_ok_items:
+            lines.append(
+                f"取消 MP 订阅：成功 {len(total_cancel_ok)}（SA已存在 {len(cancel_ok)} + 推送接管 {len(add_cancel_ok)}）"
+            )
+            if total_cancel_ok:
+                lines.append("  成功：" + "、".join(total_cancel_ok))
+            if total_cancel_fail:
+                lines.append("  失败：" + "、".join(total_cancel_fail))
         else:
             lines.append("取消 MP 订阅：无")
         if skipped:
@@ -1773,8 +1793,8 @@ class SubscribeSync(_PluginBase):
 
         return {
             "success": True,
-            "cancel": len(cancel_ok), "cancel_total": len(to_cancel),
-            "cancel_ok": cancel_ok, "cancel_fail": cancel_fail,
+            "cancel": len(total_cancel_ok), "cancel_total": len(to_cancel) + len(add_ok_items),
+            "cancel_ok": total_cancel_ok, "cancel_fail": total_cancel_fail,
             "add": len(add_ok), "add_total": len(to_add),
             "add_ok": add_ok, "add_fail": add_fail, "add_skip": add_skip,
             "skipped": skipped,
