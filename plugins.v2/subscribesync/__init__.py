@@ -249,11 +249,12 @@ class SubscribeSync(_PluginBase):
                     # ---- 源 MP 配置 ----
                     {
                         "component": "VSubheader",
-                        "props": {},
-                        "content": [{"component": "span", "props": {}, "content": [{"component": "text", "props": {}, "text": "源 MoviePilot 配置"}]}],
+                        "props": {"class": "mt-5 mb-2"},
+                        "content": [{"component": "span", "props": {"class": "text-h6 font-weight-bold"}, "content": [{"component": "text", "props": {}, "text": "源 MoviePilot 配置"}]}],
                     },
                     {
                         "component": "VRow",
+                        "props": {"class": "mb-3"},
                         "content": [
                             {
                                 "component": "VCol",
@@ -291,11 +292,12 @@ class SubscribeSync(_PluginBase):
                     # ---- 目标 SA 配置 ----
                     {
                         "component": "VSubheader",
-                        "props": {},
-                        "content": [{"component": "span", "props": {}, "content": [{"component": "text", "props": {}, "text": "目标 SA 配置"}]}],
+                        "props": {"class": "mt-5 mb-2"},
+                        "content": [{"component": "span", "props": {"class": "text-h6 font-weight-bold"}, "content": [{"component": "text", "props": {}, "text": "目标 SA 配置"}]}],
                     },
                     {
                         "component": "VRow",
+                        "props": {"class": "mb-3"},
                         "content": [
                             {
                                 "component": "VCol",
@@ -335,6 +337,7 @@ class SubscribeSync(_PluginBase):
                     },
                     {
                         "component": "VRow",
+                        "props": {"class": "mb-3"},
                         "content": [
                             {
                                 "component": "VCol",
@@ -369,11 +372,12 @@ class SubscribeSync(_PluginBase):
                     # ---- Telegram 配置 ----
                     {
                         "component": "VSubheader",
-                        "props": {},
-                        "content": [{"component": "span", "props": {}, "content": [{"component": "text", "props": {}, "text": "Telegram 通知（可选）"}]}],
+                        "props": {"class": "mt-5 mb-2"},
+                        "content": [{"component": "span", "props": {"class": "text-h6 font-weight-bold"}, "content": [{"component": "text", "props": {}, "text": "Telegram 通知（可选）"}]}],
                     },
                     {
                         "component": "VRow",
+                        "props": {"class": "mb-3"},
                         "content": [
                             {
                                 "component": "VCol",
@@ -418,11 +422,12 @@ class SubscribeSync(_PluginBase):
                     # ---- 定时任务 ----
                     {
                         "component": "VSubheader",
-                        "props": {},
-                        "content": [{"component": "span", "props": {}, "content": [{"component": "text", "props": {}, "text": "定时任务"}]}],
+                        "props": {"class": "mt-5 mb-2"},
+                        "content": [{"component": "span", "props": {"class": "text-h6 font-weight-bold"}, "content": [{"component": "text", "props": {}, "text": "定时任务"}]}],
                     },
                     {
                         "component": "VRow",
+                        "props": {"class": "mb-3"},
                         "content": [
                             {
                                 "component": "VCol",
@@ -465,6 +470,7 @@ class SubscribeSync(_PluginBase):
                     },
                     {
                         "component": "VRow",
+                        "props": {"class": "mb-3"},
                         "content": [
                             {
                                 "component": "VCol",
@@ -499,11 +505,12 @@ class SubscribeSync(_PluginBase):
                     # ---- 手动触发 ----
                     {
                         "component": "VSubheader",
-                        "props": {},
-                        "content": [{"component": "span", "props": {}, "content": [{"component": "text", "props": {}, "text": "手动触发（保存后执行一次）"}]}],
+                        "props": {"class": "mt-5 mb-2"},
+                        "content": [{"component": "span", "props": {"class": "text-h6 font-weight-bold"}, "content": [{"component": "text", "props": {}, "text": "手动触发（保存后执行一次）"}]}],
                     },
                     {
                         "component": "VRow",
+                        "props": {"class": "mb-3"},
                         "content": [
                             {
                                 "component": "VCol",
@@ -790,9 +797,7 @@ class SubscribeSync(_PluginBase):
     # ==================== 远程命令 ====================
 
     def get_command(self) -> List[Dict[str, Any]]:
-        """注册 Telegram 命令。"""
-        if not self._tg_token or not self._tg_chat:
-            return []
+        """注册 Telegram 命令（复用 MP 已配置的 Telegram 机器人）。"""
         return [
             {"cmd": "/sync_mp", "event": EventType.PluginAction, "desc": "同步 MP 订阅", "data": {"action": "sync_mp"}},
             {"cmd": "/sync_sa", "event": EventType.PluginAction, "desc": "同步 SA 订阅", "data": {"action": "sync_sa"}},

@@ -3,14 +3,15 @@
     "name": "订阅同步",
     "description": "拉取 MP 订阅与 SA telegram 订阅，按 tmdbid 对齐同步。支持电视剧查季集数、电影填模板推送、定时执行与 Telegram 命令控制。",
     "labels": "订阅,同步,SA,Telegram",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "SubscribeSync.png",
     "author": "AutoBuilder",
     "level": 1,
     "v2": true,
     "release": true,
     "history": {
-      "v1.0.0": "初始版本：MP/SA 订阅同步、mp同步sa、定时任务、TG 命令"
+      "v1.0.0": "初始版本：MP/SA 订阅同步、mp同步sa、定时任务、TG 命令",
+      "v1.1.0": "优化表单间距、命令直接注册到 MP 机器人"
     }
   }
 }
