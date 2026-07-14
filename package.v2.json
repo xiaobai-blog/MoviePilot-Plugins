@@ -3,7 +3,7 @@
     "name": "订阅同步",
     "description": "拉取 MP 订阅与 SA telegram 订阅，按 tmdbid 对齐同步。支持电视剧查季集数、电影填模板推送、定时执行与 Telegram 命令控制。",
     "labels": "订阅,同步,SA,Telegram",
-    "version": "1.5.1",
+    "version": "1.5.2",
     "icon": "SubscribeSync.png",
     "author": "AutoBuilder",
     "level": 1,
@@ -16,7 +16,8 @@
       "v1.3.0": "修复手动触发开关不重置、配置被覆盖问题；通知改用 MP 内置消息通道",
       "v1.4.0": "修复数据概览页显示 Bug；新增订阅事件监听自动触发同步",
       "v1.5.0": "通知改用 Subscribe 类型；订阅事件链执行完整 4 步序列",
-      "v1.5.1": "修复 MP 内置通知：对齐可用插件写法，改用 self.post_message 直接调用"
+      "v1.5.1": "修复 MP 内置通知：对齐可用插件写法，改用 self.post_message 直接调用",
+      "v1.5.2": "新增 PluginAction 事件处理器（TG 命令可用）；手动触发发送通知；通知日志增强"
     }
   }
 }

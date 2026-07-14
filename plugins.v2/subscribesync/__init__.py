@@ -108,7 +108,7 @@ def is_cloudflare_challenge(text: str) -> bool:
 class SubscribeSync(_PluginBase):
     # 插件元数据
     plugin_name = "订阅同步"
-    plugin_version = "1.5.1"
+    plugin_version = "1.5.2"
     plugin_author = "AutoBuilder"
     author_url = "https://github.com"
     plugin_description = (
@@ -189,12 +189,12 @@ class SubscribeSync(_PluginBase):
         self._load_cache()
         logger.info(f"[SubscribeSync] 插件初始化完成，启用状态: {self._enabled}")
 
-        # 处理手动触发开关（任务完成后自动重置）
+        # 处理手动触发开关（任务完成后自动重置，调用 API 方法确保发送通知）
         triggers = {
-            "run_sync_mp": ("同步 MP 订阅", self._sync_mp),
-            "run_sync_sa": ("同步 SA 订阅", self._sync_sa),
-            "run_sync": ("开始同步", self._sync),
-            "run_mp_sync_sa": ("mp同步sa", self._mp_sync_sa),
+            "run_sync_mp": ("同步 MP 订阅", lambda: self._api_sync_mp()),
+            "run_sync_sa": ("同步 SA 订阅", lambda: self._api_sync_sa()),
+            "run_sync": ("开始同步", lambda: self._api_sync()),
+            "run_mp_sync_sa": ("mp同步sa", lambda: self._api_mp_sync_sa()),
         }
         for key, (label, func) in triggers.items():
             if self._config.get(key):
@@ -227,6 +227,27 @@ class SubscribeSync(_PluginBase):
 
         # 延迟 5 秒执行，避免频繁触发
         self._debounce_sync()
+
+    @eventmanager.register(EventType.PluginAction)
+    def _on_plugin_action(self, event: Event):
+        """处理 TG 菜单命令触发的 PluginAction 事件。"""
+        if not self._enabled:
+            return
+        action = event.event_data.get("action") if event.event_data else None
+        if not action:
+            return
+
+        action_map = {
+            "sync_mp": ("同步 MP 订阅", self._api_sync_mp),
+            "sync_sa": ("同步 SA 订阅", self._api_sync_sa),
+            "sync": ("开始同步", self._api_sync),
+            "mp_sync_sa": ("mp同步sa", self._api_mp_sync_sa),
+            "run_sequence": ("执行任务序列", self._api_run_sequence),
+        }
+        if action in action_map:
+            label, func = action_map[action]
+            logger.info(f"[SubscribeSync] TG 命令触发：{label}")
+            threading.Thread(target=lambda f=func: f(), daemon=True).start()
 
     # 防抖：避免短时间内多次触发
     _debounce_timer = None
@@ -1794,28 +1815,23 @@ class SubscribeSync(_PluginBase):
 
     # -------- 消息通知（MP 内置通道 + 独立 TG Bot 降级） --------
     def _notify(self, title: str, text: str, image: str = ""):
-        """发送通知：通过 MP 配置的消息通道发送，失败时降级到独立 TG Bot。"""
-        # 1) MP 内置消息通道（参考 p115strgmsub 等可用插件写法）
+        """发送通知：优先通过 MP 配置的消息通道，失败时降级到独立 TG Bot。"""
+        # 1) MP 内置消息通道（写法与 p115strgmsub 等可用插件完全一致）
         try:
-            if image and (image.startswith("http://") or image.startswith("https://")):
-                self.post_message(
-                    mtype=NotificationType.Plugin,
-                    title=title,
-                    text=text,
-                    image=image,
-                )
-            else:
-                self.post_message(
-                    mtype=NotificationType.Plugin,
-                    title=title,
-                    text=text,
-                )
+            self.post_message(
+                mtype=NotificationType.Plugin,
+                title=title,
+                text=text,
+            )
             logger.info(f"[SubscribeSync] MP 内置通知已发送: {title}")
             return
         except Exception as e:
-            logger.warning(f"[SubscribeSync] MP 内置通知发送失败: {e}")
+            logger.error(f"[SubscribeSync] MP 内置通知异常: {e}", exc_info=True)
+
+
+        # 2) 降级到独立 Telegram Bot
         if not self._tg_token or not self._tg_chat:
-            logger.warning("[SubscribeSync] 无可用通知通道（MP 通知失败且未配置独立 TG Bot）")
+            logger.warning("[SubscribeSync] MP 通知失败，且未配置独立 TG Bot，通知丢失")
             return
         try:
             if image and (image.startswith("http://") or image.startswith("https://")):
@@ -1840,9 +1856,9 @@ class SubscribeSync(_PluginBase):
                     },
                     timeout=15,
                 )
-            logger.info(f"[SubscribeSync] TG Bot 通知已发送: {title}")
+            logger.info(f"[SubscribeSync] 独立 TG Bot 通知已发送: {title}")
         except Exception as e:
-            logger.warning(f"[SubscribeSync] TG Bot 通知发送失败：{e}")
+            logger.error(f"[SubscribeSync] 独立 TG Bot 通知发送失败：{e}", exc_info=True)
 
     def _seq_summary(self, results):
         """发送任务序列汇总通知。"""
